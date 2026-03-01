@@ -17,7 +17,7 @@
 #define PIR_PIN 4
 #define IR_LED_PIN 14
 
-const char* renderURL = "https://ocutemp-backend.onrender.com/predict";
+
 const char* NTP_SERVER = "pool.ntp.org";
 const long GMT_OFFSET_SEC = 8 * 3600;
 const int DAYLIGHT_OFFSET_SEC = 0;
