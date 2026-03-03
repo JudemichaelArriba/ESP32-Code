@@ -20,14 +20,30 @@ bool isFirebaseTokenPendingError(const String& err);
 bool isFirebaseRevokedError(const String& err);
 void requestFirebaseReinit(const String& reason);
 
+static const uint8_t NA_WAIT_WIFI = 0;
+static const uint8_t NA_WAIT_STABLE = 1;
+static const uint8_t NA_AUTH_INIT = 2;
+static const uint8_t NA_AUTH_WAIT = 3;
+static const uint8_t NA_READY = 4;
+
+static void setNetAuthState(uint8_t s) {
+  if (netAuthState == s) return;
+  netAuthState = s;
+  netAuthStateSince = millis();
+}
+
 bool isFirebaseTokenPendingError(const String& err) {
   return err.indexOf("token is not ready") >= 0;
 }
 
 bool isFirebaseRevokedError(const String& err) {
-  // "token is not ready (revoked or expired)" appears during token mint;
-  // treat that as pending unless the explicit pending phrase is absent.
-  return err.indexOf("revoked or expired") >= 0 && !isFirebaseTokenPendingError(err);
+  // "token is not ready (revoked or expired)" appears during token mint/refresh;
+  // this is actually a pending state, not a true revoked error.
+  // Only treat as revoked if it contains "revoked" but NOT the "token is not ready" prefix.
+  if (err.indexOf("token is not ready") >= 0) {
+    return false;  // Always treat "token is not ready" as pending, not revoked
+  }
+  return err.indexOf("revoked") >= 0 || err.indexOf("expired") >= 0;
 }
 
 bool isFirebaseAuthOrSslError(const String& err) {
@@ -38,7 +54,7 @@ bool isFirebaseAuthOrSslError(const String& err) {
 
 void requestFirebaseReinit(const String& reason) {
   unsigned long now = millis();
-  if ((now - lastStreamRetryMillis) < 5000) return;
+  if ((now - lastStreamRetryMillis) < 10000) return;
 
   lastStreamRetryMillis = now;
   Serial.println("Firebase reinit requested: " + reason);
@@ -46,6 +62,7 @@ void requestFirebaseReinit(const String& reason) {
   firebaseInitialized = false;
   startupStateLoaded = false;
   Firebase.RTDB.endStream(&streamFbdo);
+  setNetAuthState(NA_WAIT_STABLE);
 }
 
 // Implementation
@@ -57,9 +74,23 @@ void setControlStateToFirebase(bool active) {
 bool fetchAssignedRoomFromFirebase() {
   RoomConfig fetchedRoom;
 
+  if (netAuthState != NA_READY) {
+    return false;
+  }
+
   if (!Firebase.ready()) {
     return false;
   }
+
+  unsigned long now = millis();
+  if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) {
+    return false;
+  }
+
+  if ((now - lastRoomsFetchAttemptMillis) < ROOMS_FETCH_RETRY_MS) {
+    return false;
+  }
+  lastRoomsFetchAttemptMillis = now;
 
   if (!Firebase.RTDB.getJSON(&fbdo, "/rooms")) {
     String err = fbdo.errorReason();
@@ -206,16 +237,19 @@ void streamTimeoutCallback(bool timeout) {
   if (timeout) {
     streamAttached = false;
     Firebase.RTDB.endStream(&streamFbdo);
+    lastStreamRetryMillis = millis();
     Serial.println("Firebase stream timeout, retry pending.");
   }
 }
 
 void ensureControlStream() {
   if (!firebaseInitialized || WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+  if (netAuthState != NA_READY) return;
   if (streamAttached) return;
 
   unsigned long now = millis();
-  if ((now - lastStreamRetryMillis) < 2000) return;
+  if ((now - lastStreamRetryMillis) < 5000) return;
+  if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
 
   String streamPath = "/devices/" + String(DEVICE_ID) + "/control";
   if (!Firebase.RTDB.beginStream(&streamFbdo, streamPath)) {
@@ -236,7 +270,45 @@ void ensureControlStream() {
 }
 
 void reconnectWiFiNonBlocking() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  wl_status_t status = WiFi.status();
+
+  if (status == WL_CONNECTED) {
+    if (!wifiLinkUp) {
+      wifiLinkUp = true;
+      lastWiFiConnectedMillis = millis();
+      streamAttached = false;
+      startupStateLoaded = false;
+      firebaseInitialized = false;
+      setNetAuthState(NA_WAIT_STABLE);
+
+      if (!wifiHasConnectedOnce) {
+        wifiHasConnectedOnce = true;
+      } else {
+        wifiReconnectRestartPending = true;
+        wifiReconnectStableSince = millis();
+        Serial.println("WiFi restored, waiting stable then restarting...");
+      }
+    }
+
+    if (wifiReconnectRestartPending && (millis() - wifiReconnectStableSince) >= WIFI_RECONNECT_RESTART_STABLE_MS) {
+      Serial.println("WiFi stable after reconnect, restarting ESP...");
+      delay(100);
+      ESP.restart();
+    }
+    return;
+  }
+
+  if (wifiLinkUp) {
+    wifiReconnectRestartPending = false;
+  }
+
+  wifiLinkUp = false;
+  setNetAuthState(NA_WAIT_WIFI);
+
+  // Avoid reconfiguring while link state is transitioning.
+  if (status == WL_IDLE_STATUS) {
+    return;
+  }
 
   unsigned long now = millis();
   if (now - lastWiFiReconnectAttempt < WIFI_RECONNECT_MS) return;
@@ -246,21 +318,42 @@ void reconnectWiFiNonBlocking() {
   firebaseInitialized = false;
   startupStateLoaded = false;
   Serial.println("WiFi disconnected, reconnecting...");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.reconnect();
 }
-
 void initFirebaseIfNeeded() {
-  if (WiFi.status() != WL_CONNECTED || firebaseInitialized) return;
-  struct tm t;
-  if (!timeIsValid(t)) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!wifiLinkUp) return;
 
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectNetwork(true);
-  firebaseInitialized = true;
-  streamAttached = false;
-  startupStateLoaded = false;
-  Serial.println("Firebase initialized.");
+  unsigned long now = millis();
+
+  if (netAuthState == NA_WAIT_STABLE) {
+    if ((now - lastWiFiConnectedMillis) < WIFI_STABLE_BEFORE_FB_MS) {
+      return;
+    }
+    setNetAuthState(NA_AUTH_INIT);
+  }
+
+  if (netAuthState == NA_AUTH_INIT) {
+    struct tm t;
+    if (!timeIsValid(t)) return;
+
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectNetwork(true);
+    firebaseInitialized = true;
+    streamAttached = false;
+    startupStateLoaded = false;
+    lastFirebaseInitMillis = millis();
+    Serial.println("Firebase initialized.");
+    setNetAuthState(NA_AUTH_WAIT);
+    return;
+  }
+
+  if (netAuthState == NA_AUTH_WAIT) {
+    if (!Firebase.ready()) return;
+    if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
+    setNetAuthState(NA_READY);
+    return;
+  }
 }
 
 #endif

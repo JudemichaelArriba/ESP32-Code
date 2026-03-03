@@ -50,10 +50,21 @@ unsigned long lastMlxReadMillis = 0;
 unsigned long lastMLCallMillis = 0;
 unsigned long lastWiFiReconnectAttempt = 0;
 unsigned long lastNtpSyncMillis = 0;
+unsigned long lastWiFiConnectedMillis = 0;
+unsigned long lastFirebaseInitMillis = 0;
 unsigned long lastStreamRetryMillis = 0;
+unsigned long lastRoomsFetchAttemptMillis = 0;
 int lastCheckedMinuteStamp = -1;
 bool minuteGateInitialized = false;
+bool wifiLinkUp = false;
+bool wifiHasConnectedOnce = false;
+bool wifiReconnectRestartPending = false;
+unsigned long wifiReconnectStableSince = 0;
+uint8_t netAuthState = 0;
+unsigned long netAuthStateSince = 0;
 String lastScheduleMode = "boot";
+
+const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
 
 void logScheduleModeChange(const String& mode) {
   if (lastScheduleMode == mode) return;
@@ -120,9 +131,11 @@ void runMinuteControl(const struct tm& t) {
   // Inside schedule.
   logScheduleModeChange("SCHEDULE");
   unsigned long nowMs = millis();
-  bool emptyTooLong = (lastPresenceDetectedMillis == 0) || ((nowMs - lastPresenceDetectedMillis) >= OCCUPANCY_EMPTY_OFF_MS);
+  bool scheduleNoOccupancyTooLong =
+    (lastPresenceDetectedMillis == 0) ||
+    ((nowMs - lastPresenceDetectedMillis) >= SCHEDULE_NO_OCC_OFF_MS);
 
-  if (emptyTooLong) {
+  if (!presenceDetected && scheduleNoOccupancyTooLong) {
     applyAcState(false, acTempState, "empty");
     return;
   }
@@ -211,15 +224,16 @@ void loop() {
     }
 
     if (!startupStateLoaded) {
-      fetchAssignedRoomFromFirebase();
-      loadAcStateFromFirebase();
-      loadControlStateFromFirebase();
-      syncAcStateToFirebase();
-      startupStateLoaded = true;
+      if (fetchAssignedRoomFromFirebase()) {
+        loadAcStateFromFirebase();
+        loadControlStateFromFirebase();
+        syncAcStateToFirebase();
+        startupStateLoaded = true;
 
-      struct tm t;
-      if (timeIsValid(t)) {
-        runMinuteControl(t);
+        struct tm t;
+        if (timeIsValid(t)) {
+          runMinuteControl(t);
+        }
       }
     }
   }
@@ -228,9 +242,25 @@ void loop() {
   checkMinuteTickAndRunControl();
 
   if (shouldPollSensors()) {
-    refreshSensorsAndOccupancy();
+    // During scheduled time while currently unoccupied: only monitor occupancy,
+    // skip DHT/humidity/temperature writes until occupancy returns.
+    if (currentScheduleStatus.inSchedule && !manualOverrideActive && !presenceDetected) {
+      refreshOccupancyOnly();
+    } else {
+      refreshSensorsAndOccupancy();
+    }
   } else {
     disableSensorsAndOccupancyIfIdle();
   }
 }
+
+
+
+
+
+
+
+
+
+
 

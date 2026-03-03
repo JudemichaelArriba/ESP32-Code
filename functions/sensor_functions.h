@@ -4,6 +4,7 @@
 #include "../core/structures.h"
 
 void pushOccupancyIfChanged();
+void refreshOccupancyOnly();
 void refreshSensorsAndOccupancy();
 void disableSensorsAndOccupancyIfIdle();
 bool callRenderMLAndGetTarget(int& targetTempOut);
@@ -15,6 +16,35 @@ void pushOccupancyIfChanged() {
 
   String basePath = "/devices/" + String(DEVICE_ID);
   Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
+}
+
+void refreshOccupancyOnly() {
+  const unsigned long now = millis();
+
+  if (pirMotionLatched) {
+    pirMotionLatched = false;
+    lastPirMotionMillis = now;
+  }
+
+  const bool pirRawActive = PIR_ACTIVE_HIGH ? (digitalRead(PIR_PIN) == HIGH) : (digitalRead(PIR_PIN) == LOW);
+  pirMotionDetected = pirRawActive;
+
+  if ((now - lastMlxReadMillis) >= MLX_INTERVAL_MS || lastMlxReadMillis == 0) {
+    lastMlxReadMillis = now;
+    mlxObjectTemp = mlx.readObjectTempC();
+    mlxAmbientTemp = mlx.readAmbientTempC();
+    mlxPresenceDetected = !isnan(mlxObjectTemp) && (mlxObjectTemp > occupancyThreshold);
+  }
+
+  const bool pirRecentMotion = (lastPirMotionMillis != 0) && ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
+  const bool anyDetected = mlxPresenceDetected || pirRawActive || pirRecentMotion;
+
+  if (anyDetected) {
+    lastPresenceDetectedMillis = now;
+  }
+
+  presenceDetected = (lastPresenceDetectedMillis != 0) && ((now - lastPresenceDetectedMillis) <= PIR_HOLD_MS);
+  pushOccupancyIfChanged();
 }
 
 void refreshSensorsAndOccupancy() {

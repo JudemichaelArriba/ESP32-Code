@@ -82,9 +82,21 @@ extern unsigned long lastMlxReadMillis;
 extern unsigned long lastMLCallMillis;
 extern unsigned long lastWiFiReconnectAttempt;
 extern unsigned long lastNtpSyncMillis;
+extern unsigned long lastWiFiConnectedMillis;
+extern unsigned long lastFirebaseInitMillis;
 extern unsigned long lastStreamRetryMillis;
+extern unsigned long lastRoomsFetchAttemptMillis;
 extern int lastCheckedMinuteStamp;
 extern bool minuteGateInitialized;
+extern bool wifiLinkUp;
+extern bool wifiHasConnectedOnce;
+extern bool wifiReconnectRestartPending;
+extern unsigned long wifiReconnectStableSince;
 extern String lastScheduleMode;
 
+extern uint8_t netAuthState;
+extern unsigned long netAuthStateSince;
+
 #endif
+
+
