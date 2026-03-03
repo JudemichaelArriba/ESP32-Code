@@ -23,7 +23,7 @@ const unsigned long NTP_RESYNC_MS = 60000;
 
 const int AC_TEMP_MIN = 17;
 const int AC_TEMP_MAX = 30;
-const int PRECOOL_MINUTES = 15;
+const int PRECOOL_MINUTES = 10;
 const int PRECOOL_TEMP = 24;
 
 #endif

@@ -16,11 +16,22 @@ void ensureControlStream();
 void reconnectWiFiNonBlocking();
 void initFirebaseIfNeeded();
 bool isFirebaseAuthOrSslError(const String& err);
+bool isFirebaseTokenPendingError(const String& err);
+bool isFirebaseRevokedError(const String& err);
 void requestFirebaseReinit(const String& reason);
 
+bool isFirebaseTokenPendingError(const String& err) {
+  return err.indexOf("token is not ready") >= 0;
+}
+
+bool isFirebaseRevokedError(const String& err) {
+  // "token is not ready (revoked or expired)" appears during token mint;
+  // treat that as pending unless the explicit pending phrase is absent.
+  return err.indexOf("revoked or expired") >= 0 && !isFirebaseTokenPendingError(err);
+}
+
 bool isFirebaseAuthOrSslError(const String& err) {
-  return err.indexOf("token is not ready") >= 0 ||
-         err.indexOf("revoked or expired") >= 0 ||
+  return isFirebaseRevokedError(err) ||
          err.indexOf("ssl") >= 0 ||
          err.indexOf("SSL") >= 0;
 }
@@ -53,6 +64,10 @@ bool fetchAssignedRoomFromFirebase() {
   if (!Firebase.RTDB.getJSON(&fbdo, "/rooms")) {
     String err = fbdo.errorReason();
     Serial.println("Failed to read /rooms: " + err);
+    if (isFirebaseTokenPendingError(err)) {
+      // Token generation is async; avoid reinit loops while waiting.
+      return false;
+    }
     if (isFirebaseAuthOrSslError(err)) {
       requestFirebaseReinit(err);
     }
@@ -207,6 +222,9 @@ void ensureControlStream() {
     String err = streamFbdo.errorReason();
     Serial.println("Control stream begin failed: " + err);
     lastStreamRetryMillis = now;
+    if (isFirebaseTokenPendingError(err)) {
+      return;
+    }
     if (isFirebaseAuthOrSslError(err)) {
       requestFirebaseReinit(err);
     }
@@ -234,6 +252,8 @@ void reconnectWiFiNonBlocking() {
 
 void initFirebaseIfNeeded() {
   if (WiFi.status() != WL_CONNECTED || firebaseInitialized) return;
+  struct tm t;
+  if (!timeIsValid(t)) return;
 
   Firebase.begin(&config, &auth);
   Firebase.reconnectNetwork(true);

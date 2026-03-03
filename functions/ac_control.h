@@ -13,6 +13,10 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
   targetTemp = normalizeACTemp((float)targetTemp);
 
   if (targetPower == acPowerState && (!targetPower || targetTemp == acTempState)) {
+    if (acSourceState != source) {
+      acSourceState = source;
+      syncAcStateToFirebase();
+    }
     return false;
   }
 

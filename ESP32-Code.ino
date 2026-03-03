@@ -203,7 +203,9 @@ void loop() {
       String err = streamFbdo.errorReason();
       streamAttached = false;
       Firebase.RTDB.endStream(&streamFbdo);
-      if (isFirebaseAuthOrSslError(err)) {
+      if (isFirebaseTokenPendingError(err)) {
+        // Let token mint/refresh complete without resetting Firebase session.
+      } else if (isFirebaseAuthOrSslError(err)) {
         requestFirebaseReinit(err);
       }
     }
@@ -231,3 +233,4 @@ void loop() {
     disableSensorsAndOccupancyIfIdle();
   }
 }
+
