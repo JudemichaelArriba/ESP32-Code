@@ -26,7 +26,7 @@ float mlxAmbientTemp = NAN;
 bool pirMotionDetected = false;
 bool mlxPresenceDetected = false;
 bool presenceDetected = false;
-bool lastPresenceReported = false;
+bool lastPresenceReported = true;
 
 volatile bool pirMotionLatched = false;
 volatile unsigned long lastPirInterruptMillis = 0;
@@ -50,15 +50,28 @@ unsigned long lastMlxReadMillis = 0;
 unsigned long lastMLCallMillis = 0;
 unsigned long lastWiFiReconnectAttempt = 0;
 unsigned long lastNtpSyncMillis = 0;
+unsigned long lastStreamRetryMillis = 0;
 int lastCheckedMinuteStamp = -1;
 bool minuteGateInitialized = false;
+String lastScheduleMode = "boot";
+
+void logScheduleModeChange(const String& mode) {
+  if (lastScheduleMode == mode) return;
+  lastScheduleMode = mode;
+  Serial.println("Mode: " + mode);
+}
 
 void runMinuteControl(const struct tm& t) {
   fetchAssignedRoomFromFirebase();
 
   if (!assignedRoom.found) {
+    if (!Firebase.ready()) {
+      return;
+    }
+    logScheduleModeChange("NO_ASSIGNED_ROOM");
     applyAcState(false, acTempState, "no_assigned_room");
     currentScheduleStatus = ScheduleStatus();
+    disableSensorsAndOccupancyIfIdle();
     return;
   }
 
@@ -66,9 +79,11 @@ void runMinuteControl(const struct tm& t) {
 
   // Priority 1: No schedule today -> AC off.
   if (!currentScheduleStatus.hasScheduleToday) {
+    logScheduleModeChange("NO_SCHEDULE_TODAY");
     manualOverrideActive = false;
     setControlStateToFirebase(false);
     applyAcState(false, acTempState, "no_schedule_today");
+    disableSensorsAndOccupancyIfIdle();
     return;
   }
 
@@ -82,23 +97,28 @@ void runMinuteControl(const struct tm& t) {
 
   // Priority 2: Outside schedule windows -> AC off.
   if (!inAnyWindow) {
+    logScheduleModeChange("OUTSIDE_SCHEDULE");
     applyAcState(false, acTempState, "outside_schedule");
+    disableSensorsAndOccupancyIfIdle();
     return;
   }
 
   // Priority 3: Manual override.
   if (manualOverrideActive) {
+    logScheduleModeChange("MANUAL_OVERRIDE");
     applyAcState(manualOverridePower, manualOverrideTemp, "manual");
     return;
   }
 
   // Pre-cool: default temp only, no ML.
   if (currentScheduleStatus.inPreCool && !currentScheduleStatus.inSchedule) {
-    applyAcState(true, PRECOOL_TEMP, "schedule");
+    logScheduleModeChange("PRE_COOL");
+    applyAcState(true, PRECOOL_TEMP, "pre_cool");
     return;
   }
 
   // Inside schedule.
+  logScheduleModeChange("SCHEDULE");
   unsigned long nowMs = millis();
   bool emptyTooLong = (lastPresenceDetectedMillis == 0) || ((nowMs - lastPresenceDetectedMillis) >= OCCUPANCY_EMPTY_OFF_MS);
 
@@ -130,10 +150,10 @@ void checkMinuteTickAndRunControl() {
 
   int minuteStamp = t.tm_yday * 1440 + t.tm_hour * 60 + t.tm_min;
 
+  // Run once immediately when time becomes valid, then once per minute.
   if (!minuteGateInitialized) {
     minuteGateInitialized = true;
-    lastCheckedMinuteStamp = minuteStamp;
-    return;
+    lastCheckedMinuteStamp = minuteStamp - 1;
   }
 
   if (minuteStamp == lastCheckedMinuteStamp) return;
@@ -180,7 +200,12 @@ void loop() {
     ensureControlStream();
 
     if (streamAttached && !Firebase.RTDB.readStream(&streamFbdo)) {
+      String err = streamFbdo.errorReason();
       streamAttached = false;
+      Firebase.RTDB.endStream(&streamFbdo);
+      if (isFirebaseAuthOrSslError(err)) {
+        requestFirebaseReinit(err);
+      }
     }
 
     if (!startupStateLoaded) {
@@ -189,14 +214,20 @@ void loop() {
       loadControlStateFromFirebase();
       syncAcStateToFirebase();
       startupStateLoaded = true;
+
+      struct tm t;
+      if (timeIsValid(t)) {
+        runMinuteControl(t);
+      }
     }
   }
+
+  // Evaluate schedule first to reduce end-time lag.
+  checkMinuteTickAndRunControl();
 
   if (shouldPollSensors()) {
     refreshSensorsAndOccupancy();
   } else {
     disableSensorsAndOccupancyIfIdle();
   }
-
-  checkMinuteTickAndRunControl();
 }

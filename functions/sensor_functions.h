@@ -62,11 +62,9 @@ void refreshSensorsAndOccupancy() {
 }
 
 void disableSensorsAndOccupancyIfIdle() {
-  if (presenceDetected) {
-    presenceDetected = false;
-    lastPresenceDetectedMillis = 0;
-    pushOccupancyIfChanged();
-  }
+  presenceDetected = false;
+  lastPresenceDetectedMillis = 0;
+  pushOccupancyIfChanged();
 }
 
 bool callRenderMLAndGetTarget(int& targetTempOut) {

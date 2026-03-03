@@ -15,6 +15,27 @@ void streamTimeoutCallback(bool timeout);
 void ensureControlStream();
 void reconnectWiFiNonBlocking();
 void initFirebaseIfNeeded();
+bool isFirebaseAuthOrSslError(const String& err);
+void requestFirebaseReinit(const String& reason);
+
+bool isFirebaseAuthOrSslError(const String& err) {
+  return err.indexOf("token is not ready") >= 0 ||
+         err.indexOf("revoked or expired") >= 0 ||
+         err.indexOf("ssl") >= 0 ||
+         err.indexOf("SSL") >= 0;
+}
+
+void requestFirebaseReinit(const String& reason) {
+  unsigned long now = millis();
+  if ((now - lastStreamRetryMillis) < 5000) return;
+
+  lastStreamRetryMillis = now;
+  Serial.println("Firebase reinit requested: " + reason);
+  streamAttached = false;
+  firebaseInitialized = false;
+  startupStateLoaded = false;
+  Firebase.RTDB.endStream(&streamFbdo);
+}
 
 // Implementation
 void setControlStateToFirebase(bool active) {
@@ -23,10 +44,18 @@ void setControlStateToFirebase(bool active) {
 }
 
 bool fetchAssignedRoomFromFirebase() {
-  assignedRoom = RoomConfig();
+  RoomConfig fetchedRoom;
+
+  if (!Firebase.ready()) {
+    return false;
+  }
 
   if (!Firebase.RTDB.getJSON(&fbdo, "/rooms")) {
-    Serial.println("Failed to read /rooms: " + fbdo.errorReason());
+    String err = fbdo.errorReason();
+    Serial.println("Failed to read /rooms: " + err);
+    if (isFirebaseAuthOrSslError(err)) {
+      requestFirebaseReinit(err);
+    }
     return false;
   }
 
@@ -42,15 +71,15 @@ bool fetchAssignedRoomFromFirebase() {
     const char* device = room["device"] | "";
     if (String(device) != String(DEVICE_ID)) continue;
 
-    assignedRoom.found = true;
-    assignedRoom.uid = String(kv.key().c_str());
-    assignedRoom.roomName = String((const char*)(room["roomName"] | ""));
-    assignedRoom.device = String(device);
+    fetchedRoom.found = true;
+    fetchedRoom.uid = String(kv.key().c_str());
+    fetchedRoom.roomName = String((const char*)(room["roomName"] | ""));
+    fetchedRoom.device = String(device);
 
     JsonArray schedules = room["schedules"].as<JsonArray>();
     if (!schedules.isNull()) {
       for (JsonObject item : schedules) {
-        if (assignedRoom.scheduleCount >= 16) break;
+        if (fetchedRoom.scheduleCount >= 16) break;
 
         String day = String((const char*)(item["day"] | ""));
         String startTime = String((const char*)(item["startTime"] | ""));
@@ -60,10 +89,11 @@ bool fetchAssignedRoomFromFirebase() {
         int endMin = parseTimeToMinute(endTime);
         if (day.length() == 0 || startMin < 0 || endMin < 0) continue;
 
-        assignedRoom.schedules[assignedRoom.scheduleCount++] = {day, startMin, endMin};
+        fetchedRoom.schedules[fetchedRoom.scheduleCount++] = {day, startMin, endMin};
       }
     }
 
+    assignedRoom = fetchedRoom;
     Serial.printf("Assigned room: %s (%s), schedules: %d\n",
                   assignedRoom.roomName.c_str(),
                   assignedRoom.uid.c_str(),
@@ -71,8 +101,9 @@ bool fetchAssignedRoomFromFirebase() {
     return true;
   }
 
+  assignedRoom = RoomConfig();
   Serial.println("No room matched this device ID.");
-  return false;
+  return true;
 }
 
 void syncAcStateToFirebase() {
@@ -159,6 +190,7 @@ void streamCallback(FirebaseStream data) {
 void streamTimeoutCallback(bool timeout) {
   if (timeout) {
     streamAttached = false;
+    Firebase.RTDB.endStream(&streamFbdo);
     Serial.println("Firebase stream timeout, retry pending.");
   }
 }
@@ -167,9 +199,17 @@ void ensureControlStream() {
   if (!firebaseInitialized || WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   if (streamAttached) return;
 
+  unsigned long now = millis();
+  if ((now - lastStreamRetryMillis) < 2000) return;
+
   String streamPath = "/devices/" + String(DEVICE_ID) + "/control";
   if (!Firebase.RTDB.beginStream(&streamFbdo, streamPath)) {
-    Serial.println("Control stream begin failed: " + streamFbdo.errorReason());
+    String err = streamFbdo.errorReason();
+    Serial.println("Control stream begin failed: " + err);
+    lastStreamRetryMillis = now;
+    if (isFirebaseAuthOrSslError(err)) {
+      requestFirebaseReinit(err);
+    }
     return;
   }
 

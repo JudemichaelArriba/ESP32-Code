@@ -82,7 +82,9 @@ extern unsigned long lastMlxReadMillis;
 extern unsigned long lastMLCallMillis;
 extern unsigned long lastWiFiReconnectAttempt;
 extern unsigned long lastNtpSyncMillis;
+extern unsigned long lastStreamRetryMillis;
 extern int lastCheckedMinuteStamp;
 extern bool minuteGateInitialized;
+extern String lastScheduleMode;
 
 #endif
