@@ -149,11 +149,18 @@ void runMinuteControl(const struct tm& t) {
   }
 
   if ((nowMs - lastMLCallMillis) >= ML_INTERVAL_MS || lastMLCallMillis == 0) {
+    if (isnan(lastTemperature) || isnan(lastHumidity)) {
+      forceReadDhtNow();
+    }
+
     int mlTemp = acTempState;
     if (callRenderMLAndGetTarget(mlTemp)) {
       applyAcState(true, mlTemp, "ml");
+      lastMLCallMillis = nowMs;
+    } else {
+      // Retry sooner on failed ML call without affecting the normal interval.
+      lastMLCallMillis = nowMs - (ML_INTERVAL_MS - 60000UL);
     }
-    lastMLCallMillis = nowMs;
   }
 }
 
@@ -253,6 +260,7 @@ void loop() {
     disableSensorsAndOccupancyIfIdle();
   }
 }
+
 
 
 

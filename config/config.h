@@ -17,7 +17,7 @@ const unsigned long PIR_HOLD_MS = 3UL * 60UL * 1000UL;
 const unsigned long OCCUPANCY_EMPTY_OFF_MS = 20UL * 60UL * 1000UL;
 const unsigned long DHT_INTERVAL_MS = 7000;
 const unsigned long MLX_INTERVAL_MS = 3000;
-const unsigned long ML_INTERVAL_MS = 30UL * 60UL * 1000UL;
+const unsigned long ML_INTERVAL_MS = 15UL * 60UL * 1000UL;
 const unsigned long WIFI_RECONNECT_MS = 5000;
 const unsigned long WIFI_RECONNECT_RESTART_STABLE_MS = 8000;
 const unsigned long NTP_RESYNC_MS = 60000;
@@ -31,5 +31,6 @@ const int PRECOOL_MINUTES = 10;
 const int PRECOOL_TEMP = 24;
 
 #endif
+
 
 

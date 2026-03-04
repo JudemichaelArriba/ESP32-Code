@@ -7,6 +7,7 @@ void pushOccupancyIfChanged();
 void refreshOccupancyOnly();
 void refreshSensorsAndOccupancy();
 void disableSensorsAndOccupancyIfIdle();
+bool forceReadDhtNow();
 bool callRenderMLAndGetTarget(int& targetTempOut);
 
 // Implementation
@@ -95,6 +96,22 @@ void disableSensorsAndOccupancyIfIdle() {
   presenceDetected = false;
   lastPresenceDetectedMillis = 0;
   pushOccupancyIfChanged();
+}
+
+bool forceReadDhtNow() {
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(temperature)) return false;
+
+  lastDhtReadMillis = millis();
+  lastHumidity = humidity;
+  lastTemperature = temperature;
+
+  String basePath = "/devices/" + String(DEVICE_ID);
+  Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
+  Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+  return true;
 }
 
 bool callRenderMLAndGetTarget(int& targetTempOut) {
