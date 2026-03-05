@@ -63,6 +63,8 @@ unsigned long wifiReconnectStableSince = 0;
 uint8_t netAuthState = 0;
 unsigned long netAuthStateSince = 0;
 String lastScheduleMode = "boot";
+bool wasInScheduleWindow = false;
+unsigned long scheduleWindowEnteredMillis = 0;
 
 const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
 
@@ -100,6 +102,10 @@ void runMinuteControl(const struct tm& t) {
 
   const bool inAnyWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
 
+  if (!currentScheduleStatus.inSchedule) {
+    wasInScheduleWindow = false;
+  }
+
   // Clear manual override when schedule window is gone.
   if (manualOverrideActive && !inAnyWindow) {
     manualOverrideActive = false;
@@ -131,9 +137,18 @@ void runMinuteControl(const struct tm& t) {
   // Inside schedule.
   logScheduleModeChange("SCHEDULE");
   unsigned long nowMs = millis();
-  bool scheduleNoOccupancyTooLong =
-    (lastPresenceDetectedMillis == 0) ||
-    ((nowMs - lastPresenceDetectedMillis) >= SCHEDULE_NO_OCC_OFF_MS);
+
+  if (!wasInScheduleWindow) {
+    wasInScheduleWindow = true;
+    scheduleWindowEnteredMillis = nowMs;
+  }
+
+  unsigned long emptyReferenceMillis = scheduleWindowEnteredMillis;
+  if (lastPresenceDetectedMillis > emptyReferenceMillis) {
+    emptyReferenceMillis = lastPresenceDetectedMillis;
+  }
+
+  bool scheduleNoOccupancyTooLong = (nowMs - emptyReferenceMillis) >= SCHEDULE_NO_OCC_OFF_MS;
 
   if (!presenceDetected && scheduleNoOccupancyTooLong) {
     applyAcState(false, acTempState, "empty");
@@ -260,15 +275,4 @@ void loop() {
     disableSensorsAndOccupancyIfIdle();
   }
 }
-
-
-
-
-
-
-
-
-
-
-
 
