@@ -28,7 +28,7 @@ const unsigned long ROOMS_FETCH_RETRY_MS = 5000;
 const int AC_TEMP_MIN = 17;
 const int AC_TEMP_MAX = 30;
 const int PRECOOL_MINUTES = 10;
-const int PRECOOL_TEMP = 24;
+const int PRECOOL_TEMP = 17;
 
 #endif
 

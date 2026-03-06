@@ -115,8 +115,14 @@ bool forceReadDhtNow() {
 }
 
 bool callRenderMLAndGetTarget(int& targetTempOut) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  if (isnan(lastTemperature) || isnan(lastHumidity)) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("ML: skipped (WiFi not connected)");
+    return false;
+  }
+  if (isnan(lastTemperature) || isnan(lastHumidity)) {
+    Serial.println("ML: skipped (DHT data not ready)");
+    return false;
+  }
 
   HTTPClient http;
   http.begin(renderURL);
@@ -131,22 +137,41 @@ bool callRenderMLAndGetTarget(int& targetTempOut) {
 
   String body;
   serializeJson(doc, body);
+  Serial.println("ML: sending request -> " + body);
 
   int code = http.POST(body);
   if (code <= 0) {
+    Serial.printf("ML: HTTP POST failed (%d)\n", code);
     http.end();
     return false;
   }
 
   String response = http.getString();
   http.end();
+  Serial.printf("ML: HTTP %d response: %s\n", code, response.c_str());
 
   DynamicJsonDocument res(1024);
-  if (deserializeJson(res, response) != DeserializationError::Ok) return false;
-  if (!res[0]["recommended_ac"].is<float>() && !res[0]["recommended_ac"].is<int>()) return false;
+  if (deserializeJson(res, response) != DeserializationError::Ok) {
+    Serial.println("ML: parse failed");
+    return false;
+  }
 
-  targetTempOut = normalizeACTemp(res[0]["recommended_ac"].as<float>());
+  JsonVariant rec;
+  if (res.is<JsonArray>() && !res.as<JsonArray>().isNull() && res.as<JsonArray>().size() > 0) {
+    rec = res[0]["recommended_ac"];
+  } else {
+    rec = res["recommended_ac"];
+  }
+
+  if (!rec.is<float>() && !rec.is<int>()) {
+    Serial.println("ML: recommended_ac missing/invalid");
+    return false;
+  }
+
+  targetTempOut = normalizeACTemp(rec.as<float>());
+  Serial.printf("ML: recommended temp = %d\n", targetTempOut);
   return true;
 }
 
 #endif
+

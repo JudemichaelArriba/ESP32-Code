@@ -168,11 +168,14 @@ void runMinuteControl(const struct tm& t) {
       forceReadDhtNow();
     }
 
+    Serial.println("ML: attempt from schedule controller");
     int mlTemp = acTempState;
     if (callRenderMLAndGetTarget(mlTemp)) {
+      Serial.printf("ML: apply target %d\n", mlTemp);
       applyAcState(true, mlTemp, "ml");
       lastMLCallMillis = nowMs;
     } else {
+      Serial.println("ML: attempt failed, retry in ~1 minute");
       // Retry sooner on failed ML call without affecting the normal interval.
       lastMLCallMillis = nowMs - (ML_INTERVAL_MS - 60000UL);
     }
