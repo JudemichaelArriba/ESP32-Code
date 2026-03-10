@@ -127,6 +127,7 @@ bool callRenderMLAndGetTarget(int& targetTempOut) {
   HTTPClient http;
   http.begin(renderURL);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-api-key", API_KEY);
 
   StaticJsonDocument<256> doc;
   JsonArray rooms = doc.createNestedArray("rooms");
@@ -174,4 +175,6 @@ bool callRenderMLAndGetTarget(int& targetTempOut) {
 }
 
 #endif
+
+
 
