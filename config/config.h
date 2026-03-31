@@ -1,10 +1,10 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#define DHTPIN  18
+#define DHTPIN  13
 #define DHTTYPE DHT22
-#define PIR_PIN 4
-#define IR_LED_PIN 14
+#define PIR_PIN 14
+#define IR_LED_PIN 12
 
 const char* NTP_SERVER = "pool.ntp.org";
 const long GMT_OFFSET_SEC = 8 * 3600;
