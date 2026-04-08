@@ -1,3 +1,4 @@
+//ESP32_code.ino
 #include "core/structures.h"
 #include "functions/utility_functions.h"
 #include "functions/firebase_functions.h"
@@ -65,7 +66,8 @@ unsigned long netAuthStateSince = 0;
 String lastScheduleMode = "boot";
 bool wasInScheduleWindow = false;
 unsigned long scheduleWindowEnteredMillis = 0;
-
+String manualOverrideUntil = "";
+int manualOverrideTargetTemp = 24;
 const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
 
 void logScheduleModeChange(const String& mode) {
@@ -90,15 +92,18 @@ void runMinuteControl(const struct tm& t) {
 
   currentScheduleStatus = evaluateScheduleStatus(t);
 
-  // Priority 1: No schedule today -> AC off.
-  if (!currentScheduleStatus.hasScheduleToday) {
-    logScheduleModeChange("NO_SCHEDULE_TODAY");
-    manualOverrideActive = false;
-    setControlStateToFirebase(false);
-    applyAcState(false, acTempState, "no_schedule_today");
-    disableSensorsAndOccupancyIfIdle();
+// FIXED - in ESP32_code.ino, runMinuteControl()
+if (!currentScheduleStatus.hasScheduleToday) {
+  if (manualOverrideActive) {
+    logScheduleModeChange("MANUAL_OVERRIDE");
+    applyAcState(true, manualOverrideTargetTemp, "manual");
     return;
   }
+  logScheduleModeChange("NO_SCHEDULE_TODAY");
+  applyAcState(false, acTempState, "no_schedule_today");
+  disableSensorsAndOccupancyIfIdle();
+  return;
+}
 
   const bool inAnyWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
 
@@ -106,12 +111,12 @@ void runMinuteControl(const struct tm& t) {
     wasInScheduleWindow = false;
   }
 
-  // Clear manual override when schedule window is gone.
-  if (manualOverrideActive && !inAnyWindow) {
-    manualOverrideActive = false;
-    setControlStateToFirebase(false);
-  }
-
+// FIXED - in ESP32_code.ino, runMinuteControl()
+if (manualOverrideActive && !inAnyWindow) {
+  logScheduleModeChange("MANUAL_OVERRIDE");
+  applyAcState(true, manualOverrideTargetTemp, "manual");
+  return;
+}
   // Priority 2: Outside schedule windows -> AC off.
   if (!inAnyWindow) {
     logScheduleModeChange("OUTSIDE_SCHEDULE");
@@ -123,7 +128,8 @@ void runMinuteControl(const struct tm& t) {
   // Priority 3: Manual override.
   if (manualOverrideActive) {
     logScheduleModeChange("MANUAL_OVERRIDE");
-    applyAcState(manualOverridePower, manualOverrideTemp, "manual");
+    // Do NOT call ML. Do NOT check occupancy. Use user's targetTemp.
+    applyAcState(true, manualOverrideTargetTemp, "manual");
     return;
   }
 
@@ -200,6 +206,61 @@ void checkMinuteTickAndRunControl() {
   runMinuteControl(t);
 }
 
+// ESP32_code.ino — checkOverrideExpiry()
+void checkOverrideExpiry() {
+  if (!manualOverrideActive) return;
+  if (manualOverrideUntil.length() == 0) return;
+
+  // Get current LOCAL time the same way the schedule checker does
+  struct tm now;
+  if (!timeIsValid(now)) return;  // same guard as checkMinuteTickAndRunControl
+
+  // Parse overrideUntil UTC string: "2026-04-07T19:23:46.031Z"
+  int yr, mo, dy, hr, mn, sc;
+  String s = manualOverrideUntil;
+  s.replace("Z", "");
+  int dotIdx = s.indexOf('.');
+  if (dotIdx > 0) s = s.substring(0, dotIdx);
+  if (sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &yr, &mo, &dy, &hr, &mn, &sc) != 6) return;
+
+  // Convert UTC hour:min to local by adding GMT offset
+  // Work in total minutes to handle day rollover simply
+  int expiryTotalMinUTC = hr * 60 + mn;
+  int expiryTotalMinLocal = expiryTotalMinUTC + (int)(GMT_OFFSET_SEC / 60);  // +480 for UTC+8
+  // Normalize to 0–1439
+  expiryTotalMinLocal = ((expiryTotalMinLocal % 1440) + 1440) % 1440;
+
+  // Also convert expiry date to local (only the day matters for day comparison)
+  // Simplification: compare yday+year using tm fields from getLocalTime
+  // Build expiry as a local tm by shifting the UTC time
+  struct tm expiryLocal = {};
+  expiryLocal.tm_year = yr - 1900;
+  expiryLocal.tm_mon  = mo - 1;
+  expiryLocal.tm_mday = dy;
+  expiryLocal.tm_hour = hr + (int)(GMT_OFFSET_SEC / 3600);  // shift hour to local
+  expiryLocal.tm_min  = mn;
+  expiryLocal.tm_sec  = sc;
+  expiryLocal.tm_isdst = 0;
+  // Let mktime normalize overflow (e.g. hour 25 → next day)
+  mktime(&expiryLocal);
+
+  // Now compare local time fields, same as schedule uses tm_yday/tm_hour/tm_min
+  int nowDayStamp    = now.tm_year * 366 + now.tm_yday;
+  int expiryDayStamp = expiryLocal.tm_year * 366 + expiryLocal.tm_yday;
+  int nowMin         = now.tm_hour * 60 + now.tm_min;
+  int expiryMin      = expiryLocal.tm_hour * 60 + expiryLocal.tm_min;
+
+  bool expired = (nowDayStamp > expiryDayStamp) ||
+                 (nowDayStamp == expiryDayStamp && nowMin >= expiryMin);
+
+  if (expired) {
+    Serial.println("Override expired, clearing and turning AC off.");
+    manualOverrideActive = false;
+    manualOverrideUntil  = "";
+    applyAcState(false, acTempState, "override_expired");
+    clearOverrideInFirebase();
+  }
+}
 void setup() {
   Serial.begin(115200);
 
@@ -265,15 +326,19 @@ void loop() {
 
   // Evaluate schedule first to reduce end-time lag.
   checkMinuteTickAndRunControl();
-
-  if (shouldPollSensors()) {
-    // During scheduled time while currently unoccupied: only monitor occupancy,
-    // skip DHT/humidity/temperature writes until occupancy returns.
+ struct tm _tCheck;
+if (timeIsValid(_tCheck)) {
+  checkOverrideExpiry();
+}
+if (shouldPollSensors()) {
     if (currentScheduleStatus.inSchedule && !manualOverrideActive && !presenceDetected) {
       refreshOccupancyOnly();
     } else {
       refreshSensorsAndOccupancy();
     }
+  } else if (manualOverrideActive) {
+    // During override outside schedule: still read sensors, just don't ML
+    refreshSensorsAndOccupancy();
   } else {
     disableSensorsAndOccupancyIfIdle();
   }

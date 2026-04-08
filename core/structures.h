@@ -1,3 +1,4 @@
+//structures.h
 #ifndef STRUCTURES_H
 #define STRUCTURES_H
 
@@ -97,6 +98,8 @@ extern String lastScheduleMode;
 extern uint8_t netAuthState;
 extern unsigned long netAuthStateSince;
 
+extern String manualOverrideUntil;   // ISO string of when override ends
+extern int manualOverrideTargetTemp; // user-set target temp
 #endif
 
 

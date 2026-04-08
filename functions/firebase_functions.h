@@ -1,3 +1,4 @@
+//firebase_functions.h
 #ifndef FIREBASE_FUNCTIONS_H
 #define FIREBASE_FUNCTIONS_H
 
@@ -183,11 +184,23 @@ void loadControlStateFromFirebase() {
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
 
-  if (!doc["overrideActive"].isNull()) manualOverrideActive = doc["overrideActive"].as<bool>();
-  else if (!doc["active"].isNull()) manualOverrideActive = doc["active"].as<bool>();
+  bool active = false;
+  if (!doc["overrideActive"].isNull()) active = doc["overrideActive"].as<bool>();
+  else if (!doc["active"].isNull()) active = doc["active"].as<bool>();
+
+  manualOverrideActive = active;
+
+  if (!doc["targetTemp"].isNull())
+    manualOverrideTargetTemp = normalizeACTemp((float)doc["targetTemp"].as<int>());
+  else if (!doc["temp"].isNull())
+    manualOverrideTargetTemp = normalizeACTemp((float)doc["temp"].as<int>());
+
+  if (!doc["overrideUntil"].isNull())
+    manualOverrideUntil = doc["overrideUntil"].as<String>();
+  else
+    manualOverrideUntil = "";
 
   if (!doc["power"].isNull()) manualOverridePower = doc["power"].as<bool>();
-  if (!doc["temp"].isNull()) manualOverrideTemp = normalizeACTemp((float)doc["temp"].as<int>());
 }
 
 void streamCallback(FirebaseStream data);  // Forward declaration
@@ -197,10 +210,39 @@ void streamCallback(FirebaseStream data) {
   String path = data.dataPath();
   String type = data.dataType();
 
+  Serial.println("Stream update: " + path + " [" + type + "]");
+
   if (type == "json") {
     DynamicJsonDocument doc(512);
     if (deserializeJson(doc, data.stringData()) == DeserializationError::Ok) {
-      applyControlJson(doc.as<JsonVariant>());
+      JsonVariant v = doc.as<JsonVariant>();
+
+      bool active = false;
+      if (!v["overrideActive"].isNull()) active = v["overrideActive"].as<bool>();
+      else if (!v["active"].isNull()) active = v["active"].as<bool>();
+
+      manualOverrideActive = active;
+
+      if (!v["targetTemp"].isNull())
+        manualOverrideTargetTemp = normalizeACTemp((float)v["targetTemp"].as<int>());
+      else if (!v["temp"].isNull())
+        manualOverrideTargetTemp = normalizeACTemp((float)v["temp"].as<int>());
+
+      if (!v["overrideUntil"].isNull())
+        manualOverrideUntil = v["overrideUntil"].as<String>();
+      else
+        manualOverrideUntil = "";
+
+      if (!v["power"].isNull()) manualOverridePower = v["power"].as<bool>();
+
+      // React immediately
+      if (manualOverrideActive) {
+        Serial.println("Stream: override ON, applying immediately");
+        applyAcState(true, manualOverrideTargetTemp, "manual");
+      } else {
+        Serial.println("Stream: override OFF, turning AC off");
+        applyAcState(false, acTempState, "override_cleared");
+      }
     }
     return;
   }
@@ -208,27 +250,34 @@ void streamCallback(FirebaseStream data) {
   if ((path == "/overrideActive" || path == "/active") && type == "boolean") {
     manualOverrideActive = data.boolData();
     if (!manualOverrideActive) {
-      acSourceState = "manual_cleared";
-      syncAcStateToFirebase();
+      Serial.println("Stream: overrideActive=false, turning AC off");
+      applyAcState(false, acTempState, "override_cleared");
+      manualOverrideUntil = "";
     } else {
-      manualOverridePower = acPowerState;
-      manualOverrideTemp = acTempState;
+      Serial.println("Stream: overrideActive=true, applying override temp");
+      applyAcState(true, manualOverrideTargetTemp, "manual");
     }
+    return;
+  }
+
+  if (path == "/targetTemp" && (type == "int" || type == "float" || type == "double")) {
+    manualOverrideTargetTemp = normalizeACTemp((float)data.floatData());
+    if (manualOverrideActive) {
+      applyAcState(true, manualOverrideTargetTemp, "manual");
+    }
+    return;
+  }
+
+  if (path == "/overrideUntil" && type == "string") {
+    manualOverrideUntil = data.stringData();
     return;
   }
 
   if (path == "/power" && type == "boolean") {
     manualOverridePower = data.boolData();
-    manualOverrideActive = true;
-    applyAcState(manualOverridePower, acTempState, "manual");
-    return;
-  }
-
-  if (path == "/temp" && (type == "int" || type == "float" || type == "double")) {
-    manualOverrideTemp = normalizeACTemp((float)data.floatData());
-    manualOverrideActive = true;
-    manualOverridePower = true;
-    applyAcState(true, manualOverrideTemp, "manual");
+    if (manualOverrideActive) {
+      applyAcState(manualOverridePower, manualOverrideTargetTemp, "manual");
+    }
     return;
   }
 }
@@ -354,6 +403,14 @@ void initFirebaseIfNeeded() {
     setNetAuthState(NA_READY);
     return;
   }
+}
+
+void clearOverrideInFirebase() {
+  String base = "/devices/" + String(DEVICE_ID) + "/control";
+  Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
+
+  String acBase = "/devices/" + String(DEVICE_ID) + "/acState";
+  Firebase.RTDB.setString(&fbdo, acBase + "/source", "override_expired");
 }
 
 #endif
