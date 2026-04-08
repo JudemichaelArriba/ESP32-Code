@@ -2,6 +2,7 @@
 #include "core/structures.h"
 #include "functions/utility_functions.h"
 #include "functions/firebase_functions.h"
+#include "functions/energy_functions.h"
 #include "functions/ac_control.h"
 #include "functions/schedule_functions.h"
 #include "functions/sensor_functions.h"
@@ -18,6 +19,8 @@ IRCoolixAC coolixAc(IR_LED_PIN);
 // Define global variables
 RoomConfig assignedRoom;
 ScheduleStatus currentScheduleStatus;
+EnergyRuntimeState energyRuntimeState;
+EnergyDailyCache energyDailyCache;
 
 float lastHumidity = NAN;
 float lastTemperature = NAN;
@@ -68,6 +71,7 @@ bool wasInScheduleWindow = false;
 unsigned long scheduleWindowEnteredMillis = 0;
 String manualOverrideUntil = "";
 int manualOverrideTargetTemp = 24;
+int estimatedWattsOn = DEFAULT_ESTIMATED_WATTS_ON;
 const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
 
 void logScheduleModeChange(const String& mode) {
@@ -313,7 +317,11 @@ void loop() {
       if (fetchAssignedRoomFromFirebase()) {
         loadAcStateFromFirebase();
         loadControlStateFromFirebase();
+        loadEnergyProfileFromFirebase();
+        loadEnergyStateFromFirebase();
         syncAcStateToFirebase();
+        syncEnergyProfileToFirebase();
+        initializeEnergyTrackingForCurrentState();
         startupStateLoaded = true;
 
         struct tm t;
@@ -330,6 +338,7 @@ void loop() {
 if (timeIsValid(_tCheck)) {
   checkOverrideExpiry();
 }
+  tickEnergyTracking();
 if (shouldPollSensors()) {
     if (currentScheduleStatus.inSchedule && !manualOverrideActive && !presenceDetected) {
       refreshOccupancyOnly();

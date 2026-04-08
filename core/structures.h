@@ -38,6 +38,24 @@ struct ScheduleStatus {
   bool inSchedule = false;
 };
 
+struct EnergyRuntimeState {
+  bool active = false;
+  String roomUid;
+  String sessionStartedAt;
+  String lastFlushAt;
+  String lastSource;
+  String dateKey;
+};
+
+struct EnergyDailyCache {
+  bool loaded = false;
+  String dateKey;
+  String roomUid;
+  unsigned long runtimeSeconds = 0;
+  float estimatedKwh = 0.0f;
+  unsigned long sessionCount = 0;
+};
+
 // Global objects
 extern DHT dht;
 extern FirebaseData fbdo;
@@ -50,6 +68,8 @@ extern IRCoolixAC coolixAc;
 // Global variables
 extern RoomConfig assignedRoom;
 extern ScheduleStatus currentScheduleStatus;
+extern EnergyRuntimeState energyRuntimeState;
+extern EnergyDailyCache energyDailyCache;
 
 extern float lastHumidity;
 extern float lastTemperature;
@@ -100,6 +120,6 @@ extern unsigned long netAuthStateSince;
 
 extern String manualOverrideUntil;   // ISO string of when override ends
 extern int manualOverrideTargetTemp; // user-set target temp
+extern int estimatedWattsOn;
 #endif
-
 

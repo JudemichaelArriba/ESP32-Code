@@ -5,6 +5,7 @@
 #include "../core/structures.h"
 #include "utility_functions.h"
 #include "firebase_functions.h"
+#include "energy_functions.h"
 
 bool applyAcState(bool targetPower, int targetTemp, const String& source);
 void applyControlJson(JsonVariant data);
@@ -12,6 +13,7 @@ void applyControlJson(JsonVariant data);
 // Implementation
 bool applyAcState(bool targetPower, int targetTemp, const String& source) {
   targetTemp = normalizeACTemp((float)targetTemp);
+  bool previousPower = acPowerState;
 
   if (targetPower == acPowerState && (!targetPower || targetTemp == acTempState)) {
     if (acSourceState != source) {
@@ -37,6 +39,7 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
   acPowerState = targetPower;
   acSourceState = source;
   syncAcStateToFirebase();
+  handleEnergyPowerTransition(previousPower, acPowerState, source);
   return true;
 }
 

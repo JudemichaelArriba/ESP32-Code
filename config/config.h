@@ -25,13 +25,14 @@ const unsigned long NTP_RESYNC_MS = 60000;
 const unsigned long WIFI_STABLE_BEFORE_FB_MS = 5000;
 const unsigned long FIREBASE_AUTH_SETTLE_MS = 20000;
 const unsigned long ROOMS_FETCH_RETRY_MS = 5000;
+const unsigned long ENERGY_FLUSH_INTERVAL_SEC = 60UL;
 
 const int AC_TEMP_MIN = 17;
 const int AC_TEMP_MAX = 30;
 const int PRECOOL_MINUTES = 10;
 const int PRECOOL_TEMP = 17;
+const int DEFAULT_ESTIMATED_WATTS_ON = 950;
 
 #endif
-
 
 
