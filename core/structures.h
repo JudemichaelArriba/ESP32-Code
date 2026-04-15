@@ -1,4 +1,3 @@
-//structures.h
 #ifndef STRUCTURES_H
 #define STRUCTURES_H
 
@@ -118,8 +117,15 @@ extern String lastScheduleMode;
 extern uint8_t netAuthState;
 extern unsigned long netAuthStateSince;
 
-extern String manualOverrideUntil;   // ISO string of when override ends
-extern int manualOverrideTargetTemp; // user-set target temp
+extern String manualOverrideUntil;
+extern int manualOverrideTargetTemp;
 extern int estimatedWattsOn;
-#endif
 
+
+// forcedOffActive      — true while the "OFF" button is in effect; blocks all schedule/manual logic
+// forcedOffSeenWindow  — tracks whether we were inside a window when forced off,
+//                        so we know when a genuinely NEW window starts (= safe to resume)
+extern bool forcedOffActive;
+extern bool forcedOffSeenWindow;
+
+#endif

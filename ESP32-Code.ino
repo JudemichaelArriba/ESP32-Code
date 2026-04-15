@@ -1,4 +1,3 @@
-//ESP32_code.ino
 #include "core/structures.h"
 #include "functions/utility_functions.h"
 #include "functions/firebase_functions.h"
@@ -7,7 +6,6 @@
 #include "functions/schedule_functions.h"
 #include "functions/sensor_functions.h"
 
-// Define global objects
 DHT dht(DHTPIN, DHTTYPE);
 FirebaseData fbdo;
 FirebaseData streamFbdo;
@@ -16,63 +14,73 @@ FirebaseConfig config;
 Adafruit_MLX90614 mlx = Adafruit_MLX90614();
 IRCoolixAC coolixAc(IR_LED_PIN);
 
-// Define global variables
 RoomConfig assignedRoom;
 ScheduleStatus currentScheduleStatus;
 EnergyRuntimeState energyRuntimeState;
 EnergyDailyCache energyDailyCache;
 
-float lastHumidity = NAN;
+float lastHumidity    = NAN;
 float lastTemperature = NAN;
-float mlxObjectTemp = NAN;
-float mlxAmbientTemp = NAN;
+float mlxObjectTemp   = NAN;
+float mlxAmbientTemp  = NAN;
 
-bool pirMotionDetected = false;
-bool mlxPresenceDetected = false;
-bool presenceDetected = false;
+bool pirMotionDetected    = false;
+bool mlxPresenceDetected  = false;
+bool presenceDetected     = false;
 bool lastPresenceReported = true;
 
-volatile bool pirMotionLatched = false;
+volatile bool pirMotionLatched             = false;
 volatile unsigned long lastPirInterruptMillis = 0;
-unsigned long lastPirMotionMillis = 0;
-unsigned long lastPresenceDetectedMillis = 0;
+unsigned long lastPirMotionMillis          = 0;
+unsigned long lastPresenceDetectedMillis   = 0;
 
-bool acPowerState = false;
-int acTempState = 24;
+bool   acPowerState  = false;
+int    acTempState   = 24;
 String acSourceState = "boot";
 
 bool manualOverrideActive = false;
-bool manualOverridePower = false;
-int manualOverrideTemp = 24;
+bool manualOverridePower  = false;
+int  manualOverrideTemp   = 24;
 
-bool streamAttached = false;
+bool streamAttached     = false;
 bool firebaseInitialized = false;
-bool startupStateLoaded = false;
+bool startupStateLoaded  = false;
 
-unsigned long lastDhtReadMillis = 0;
-unsigned long lastMlxReadMillis = 0;
-unsigned long lastMLCallMillis = 0;
-unsigned long lastWiFiReconnectAttempt = 0;
-unsigned long lastNtpSyncMillis = 0;
-unsigned long lastWiFiConnectedMillis = 0;
-unsigned long lastFirebaseInitMillis = 0;
-unsigned long lastStreamRetryMillis = 0;
-unsigned long lastRoomsFetchAttemptMillis = 0;
-int lastCheckedMinuteStamp = -1;
-bool minuteGateInitialized = false;
-bool wifiLinkUp = false;
-bool wifiHasConnectedOnce = false;
+unsigned long lastDhtReadMillis            = 0;
+unsigned long lastMlxReadMillis            = 0;
+unsigned long lastMLCallMillis             = 0;
+unsigned long lastWiFiReconnectAttempt     = 0;
+unsigned long lastNtpSyncMillis            = 0;
+unsigned long lastWiFiConnectedMillis      = 0;
+unsigned long lastFirebaseInitMillis       = 0;
+unsigned long lastStreamRetryMillis        = 0;
+unsigned long lastRoomsFetchAttemptMillis  = 0;
+int  lastCheckedMinuteStamp    = -1;
+bool minuteGateInitialized     = false;
+bool wifiLinkUp                = false;
+bool wifiHasConnectedOnce      = false;
 bool wifiReconnectRestartPending = false;
 unsigned long wifiReconnectStableSince = 0;
-uint8_t netAuthState = 0;
+uint8_t       netAuthState     = 0;
 unsigned long netAuthStateSince = 0;
-String lastScheduleMode = "boot";
-bool wasInScheduleWindow = false;
+String lastScheduleMode        = "boot";
+bool   wasInScheduleWindow     = false;
 unsigned long scheduleWindowEnteredMillis = 0;
-String manualOverrideUntil = "";
-int manualOverrideTargetTemp = 24;
-int estimatedWattsOn = DEFAULT_ESTIMATED_WATTS_ON;
+String manualOverrideUntil     = "";
+int    manualOverrideTargetTemp = 24;
+int    estimatedWattsOn        = DEFAULT_ESTIMATED_WATTS_ON;
+
 const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
+
+// forcedOff state variables (definitions — externs declared in structures.h)
+// forcedOffActive     : true = OFF button was pressed; block all schedule/manual logic
+// forcedOffSeenWindow : true = we were inside a schedule/pre-cool window at the time
+//                       of the press; cleared when we leave that window so the NEXT
+//                       window is treated as brand-new and automatically resumes.
+bool forcedOffActive    = false;
+bool forcedOffSeenWindow = false;
+
+
 
 void logScheduleModeChange(const String& mode) {
   if (lastScheduleMode == mode) return;
@@ -84,9 +92,7 @@ void runMinuteControl(const struct tm& t) {
   fetchAssignedRoomFromFirebase();
 
   if (!assignedRoom.found) {
-    if (!Firebase.ready()) {
-      return;
-    }
+    if (!Firebase.ready()) return;
     logScheduleModeChange("NO_ASSIGNED_ROOM");
     applyAcState(false, acTempState, "no_assigned_room");
     currentScheduleStatus = ScheduleStatus();
@@ -96,32 +102,66 @@ void runMinuteControl(const struct tm& t) {
 
   currentScheduleStatus = evaluateScheduleStatus(t);
 
-// FIXED - in ESP32_code.ino, runMinuteControl()
-if (!currentScheduleStatus.hasScheduleToday) {
-  if (manualOverrideActive) {
-    logScheduleModeChange("MANUAL_OVERRIDE");
-    applyAcState(true, manualOverrideTargetTemp, "manual");
-    return;
-  }
-  logScheduleModeChange("NO_SCHEDULE_TODAY");
-  applyAcState(false, acTempState, "no_schedule_today");
-  disableSensorsAndOccupancyIfIdle();
-  return;
-}
-
   const bool inAnyWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+
+
+  // When forcedOffActive is true we keep the AC off and ignore every
+  // schedule / pre-cool / manual trigger.  The gate is lifted only when:
+  //   (a) We have LEFT the window that was active when forced off (so
+  //       forcedOffSeenWindow is cleared), AND a NEW window has started — this
+  //       means the next scheduled period will resume automatically, OR
+  //   (b) The user sends a new manual override ON command (handled in
+  //       streamCallback, which clears forcedOffActive before we reach here).
+  if (forcedOffActive) {
+    if (inAnyWindow) {
+      if (!forcedOffSeenWindow) {
+        // We have exited the old window and just entered a brand-new one
+        // lift the forced-off block and fall through to normal logic below.
+        forcedOffActive    = false;
+        forcedOffSeenWindow = false;
+        Serial.println("ForcedOff: new schedule window detected — resuming normal control.");
+        // fall through intentionally
+      } else {
+        // Still inside (or back inside) the SAME window that was forced off
+        // stay off, do nothing.
+        logScheduleModeChange("FORCED_OFF");
+        applyAcState(false, acTempState, "forced_off");
+        return;
+      }
+    } else {
+      // Outside any window mark that we have fully left the forced-off window.
+      // The next time inAnyWindow becomes true it will be a new window.
+      forcedOffSeenWindow = false;   // clear so next window is fresh
+      logScheduleModeChange("FORCED_OFF");
+      applyAcState(false, acTempState, "forced_off");
+      disableSensorsAndOccupancyIfIdle();
+      return;
+    }
+  }
+  
 
   if (!currentScheduleStatus.inSchedule) {
     wasInScheduleWindow = false;
   }
 
-// FIXED - in ESP32_code.ino, runMinuteControl()
-if (manualOverrideActive && !inAnyWindow) {
-  logScheduleModeChange("MANUAL_OVERRIDE");
-  applyAcState(true, manualOverrideTargetTemp, "manual");
-  return;
-}
-  // Priority 2: Outside schedule windows -> AC off.
+  if (!currentScheduleStatus.hasScheduleToday) {
+    if (manualOverrideActive) {
+      logScheduleModeChange("MANUAL_OVERRIDE");
+      applyAcState(true, manualOverrideTargetTemp, "manual");
+      return;
+    }
+    logScheduleModeChange("NO_SCHEDULE_TODAY");
+    applyAcState(false, acTempState, "no_schedule_today");
+    disableSensorsAndOccupancyIfIdle();
+    return;
+  }
+
+  if (manualOverrideActive && !inAnyWindow) {
+    logScheduleModeChange("MANUAL_OVERRIDE");
+    applyAcState(true, manualOverrideTargetTemp, "manual");
+    return;
+  }
+
   if (!inAnyWindow) {
     logScheduleModeChange("OUTSIDE_SCHEDULE");
     applyAcState(false, acTempState, "outside_schedule");
@@ -129,22 +169,18 @@ if (manualOverrideActive && !inAnyWindow) {
     return;
   }
 
-  // Priority 3: Manual override.
   if (manualOverrideActive) {
     logScheduleModeChange("MANUAL_OVERRIDE");
-    // Do NOT call ML. Do NOT check occupancy. Use user's targetTemp.
     applyAcState(true, manualOverrideTargetTemp, "manual");
     return;
   }
 
-  // Pre-cool: default temp only, no ML.
   if (currentScheduleStatus.inPreCool && !currentScheduleStatus.inSchedule) {
     logScheduleModeChange("PRE_COOL");
     applyAcState(true, PRECOOL_TEMP, "pre_cool");
     return;
   }
 
-  // Inside schedule.
   logScheduleModeChange("SCHEDULE");
   unsigned long nowMs = millis();
 
@@ -165,18 +201,14 @@ if (manualOverrideActive && !inAnyWindow) {
     return;
   }
 
-  if (!presenceDetected) {
-    return;
-  }
+  if (!presenceDetected) return;
 
   if (!acPowerState) {
     applyAcState(true, PRECOOL_TEMP, "schedule");
   }
 
   if ((nowMs - lastMLCallMillis) >= ML_INTERVAL_MS || lastMLCallMillis == 0) {
-    if (isnan(lastTemperature) || isnan(lastHumidity)) {
-      forceReadDhtNow();
-    }
+    if (isnan(lastTemperature) || isnan(lastHumidity)) forceReadDhtNow();
 
     Serial.println("ML: attempt from schedule controller");
     int mlTemp = acTempState;
@@ -186,7 +218,6 @@ if (manualOverrideActive && !inAnyWindow) {
       lastMLCallMillis = nowMs;
     } else {
       Serial.println("ML: attempt failed, retry in ~1 minute");
-      // Retry sooner on failed ML call without affecting the normal interval.
       lastMLCallMillis = nowMs - (ML_INTERVAL_MS - 60000UL);
     }
   }
@@ -198,10 +229,9 @@ void checkMinuteTickAndRunControl() {
 
   int minuteStamp = t.tm_yday * 1440 + t.tm_hour * 60 + t.tm_min;
 
-  // Run once immediately when time becomes valid, then once per minute.
   if (!minuteGateInitialized) {
-    minuteGateInitialized = true;
-    lastCheckedMinuteStamp = minuteStamp - 1;
+    minuteGateInitialized    = true;
+    lastCheckedMinuteStamp   = minuteStamp - 1;
   }
 
   if (minuteStamp == lastCheckedMinuteStamp) return;
@@ -210,16 +240,13 @@ void checkMinuteTickAndRunControl() {
   runMinuteControl(t);
 }
 
-// ESP32_code.ino — checkOverrideExpiry()
 void checkOverrideExpiry() {
   if (!manualOverrideActive) return;
   if (manualOverrideUntil.length() == 0) return;
 
-  // Get current LOCAL time the same way the schedule checker does
   struct tm now;
-  if (!timeIsValid(now)) return;  // same guard as checkMinuteTickAndRunControl
+  if (!timeIsValid(now)) return;
 
-  // Parse overrideUntil UTC string: "2026-04-07T19:23:46.031Z"
   int yr, mo, dy, hr, mn, sc;
   String s = manualOverrideUntil;
   s.replace("Z", "");
@@ -227,28 +254,16 @@ void checkOverrideExpiry() {
   if (dotIdx > 0) s = s.substring(0, dotIdx);
   if (sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &yr, &mo, &dy, &hr, &mn, &sc) != 6) return;
 
-  // Convert UTC hour:min to local by adding GMT offset
-  // Work in total minutes to handle day rollover simply
-  int expiryTotalMinUTC = hr * 60 + mn;
-  int expiryTotalMinLocal = expiryTotalMinUTC + (int)(GMT_OFFSET_SEC / 60);  // +480 for UTC+8
-  // Normalize to 0–1439
-  expiryTotalMinLocal = ((expiryTotalMinLocal % 1440) + 1440) % 1440;
-
-  // Also convert expiry date to local (only the day matters for day comparison)
-  // Simplification: compare yday+year using tm fields from getLocalTime
-  // Build expiry as a local tm by shifting the UTC time
   struct tm expiryLocal = {};
-  expiryLocal.tm_year = yr - 1900;
-  expiryLocal.tm_mon  = mo - 1;
-  expiryLocal.tm_mday = dy;
-  expiryLocal.tm_hour = hr + (int)(GMT_OFFSET_SEC / 3600);  // shift hour to local
-  expiryLocal.tm_min  = mn;
-  expiryLocal.tm_sec  = sc;
+  expiryLocal.tm_year  = yr - 1900;
+  expiryLocal.tm_mon   = mo - 1;
+  expiryLocal.tm_mday  = dy;
+  expiryLocal.tm_hour  = hr + (int)(GMT_OFFSET_SEC / 3600);
+  expiryLocal.tm_min   = mn;
+  expiryLocal.tm_sec   = sc;
   expiryLocal.tm_isdst = 0;
-  // Let mktime normalize overflow (e.g. hour 25 → next day)
   mktime(&expiryLocal);
 
-  // Now compare local time fields, same as schedule uses tm_yday/tm_hour/tm_min
   int nowDayStamp    = now.tm_year * 366 + now.tm_yday;
   int expiryDayStamp = expiryLocal.tm_year * 366 + expiryLocal.tm_yday;
   int nowMin         = now.tm_hour * 60 + now.tm_min;
@@ -265,6 +280,7 @@ void checkOverrideExpiry() {
     clearOverrideInFirebase();
   }
 }
+
 void setup() {
   Serial.begin(115200);
 
@@ -280,9 +296,9 @@ void setup() {
   }
 
   config.database_url = String("https://") + FIREBASE_HOST;
-  config.api_key = FIREBASE_API_KEY;
-  auth.user.email = ESP_EMAIL;
-  auth.user.password = ESP_PASSWORD;
+  config.api_key      = FIREBASE_API_KEY;
+  auth.user.email     = ESP_EMAIL;
+  auth.user.password  = ESP_PASSWORD;
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -294,7 +310,8 @@ void loop() {
   reconnectWiFiNonBlocking();
   initFirebaseIfNeeded();
 
-  if (WiFi.status() == WL_CONNECTED && (millis() - lastNtpSyncMillis >= NTP_RESYNC_MS || lastNtpSyncMillis == 0)) {
+  if (WiFi.status() == WL_CONNECTED &&
+      (millis() - lastNtpSyncMillis >= NTP_RESYNC_MS || lastNtpSyncMillis == 0)) {
     configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
     lastNtpSyncMillis = millis();
   }
@@ -307,7 +324,7 @@ void loop() {
       streamAttached = false;
       Firebase.RTDB.endStream(&streamFbdo);
       if (isFirebaseTokenPendingError(err)) {
-        // Let token mint/refresh complete without resetting Firebase session.
+        // Let token mint/refresh finish — do not reset session
       } else if (isFirebaseAuthOrSslError(err)) {
         requestFirebaseReinit(err);
       }
@@ -316,7 +333,7 @@ void loop() {
     if (!startupStateLoaded) {
       if (fetchAssignedRoomFromFirebase()) {
         loadAcStateFromFirebase();
-        loadControlStateFromFirebase();
+        loadControlStateFromFirebase();   // forcedOff is read & acknowledged here
         loadEnergyProfileFromFirebase();
         loadEnergyStateFromFirebase();
         syncAcStateToFirebase();
@@ -326,30 +343,30 @@ void loop() {
 
         struct tm t;
         if (timeIsValid(t)) {
-          runMinuteControl(t);
+          runMinuteControl(t);            // forcedOff gate is active from here if loaded
         }
       }
     }
   }
 
-  // Evaluate schedule first to reduce end-time lag.
   checkMinuteTickAndRunControl();
- struct tm _tCheck;
-if (timeIsValid(_tCheck)) {
-  checkOverrideExpiry();
-}
+
+  struct tm _tCheck;
+  if (timeIsValid(_tCheck)) {
+    checkOverrideExpiry();
+  }
+
   tickEnergyTracking();
-if (shouldPollSensors()) {
+
+  if (shouldPollSensors()) {
     if (currentScheduleStatus.inSchedule && !manualOverrideActive && !presenceDetected) {
       refreshOccupancyOnly();
     } else {
       refreshSensorsAndOccupancy();
     }
   } else if (manualOverrideActive) {
-    // During override outside schedule: still read sensors, just don't ML
     refreshSensorsAndOccupancy();
   } else {
     disableSensorsAndOccupancyIfIdle();
   }
 }
-

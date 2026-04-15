@@ -1,4 +1,3 @@
-//firebase_functions.h
 #ifndef FIREBASE_FUNCTIONS_H
 #define FIREBASE_FUNCTIONS_H
 
@@ -21,11 +20,11 @@ bool isFirebaseTokenPendingError(const String& err);
 bool isFirebaseRevokedError(const String& err);
 void requestFirebaseReinit(const String& reason);
 
-static const uint8_t NA_WAIT_WIFI = 0;
+static const uint8_t NA_WAIT_WIFI   = 0;
 static const uint8_t NA_WAIT_STABLE = 1;
-static const uint8_t NA_AUTH_INIT = 2;
-static const uint8_t NA_AUTH_WAIT = 3;
-static const uint8_t NA_READY = 4;
+static const uint8_t NA_AUTH_INIT   = 2;
+static const uint8_t NA_AUTH_WAIT   = 3;
+static const uint8_t NA_READY       = 4;
 
 static void setNetAuthState(uint8_t s) {
   if (netAuthState == s) return;
@@ -38,12 +37,7 @@ bool isFirebaseTokenPendingError(const String& err) {
 }
 
 bool isFirebaseRevokedError(const String& err) {
-  // "token is not ready (revoked or expired)" appears during token mint/refresh;
-  // this is actually a pending state, not a true revoked error.
-  // Only treat as revoked if it contains "revoked" but NOT the "token is not ready" prefix.
-  if (err.indexOf("token is not ready") >= 0) {
-    return false;  // Always treat "token is not ready" as pending, not revoked
-  }
+  if (err.indexOf("token is not ready") >= 0) return false;
   return err.indexOf("revoked") >= 0 || err.indexOf("expired") >= 0;
 }
 
@@ -66,7 +60,6 @@ void requestFirebaseReinit(const String& reason) {
   setNetAuthState(NA_WAIT_STABLE);
 }
 
-// Implementation
 void setControlStateToFirebase(bool active) {
   String controlPath = "/devices/" + String(DEVICE_ID) + "/control/overrideActive";
   Firebase.RTDB.setBool(&fbdo, controlPath, active);
@@ -75,34 +68,19 @@ void setControlStateToFirebase(bool active) {
 bool fetchAssignedRoomFromFirebase() {
   RoomConfig fetchedRoom;
 
-  if (netAuthState != NA_READY) {
-    return false;
-  }
-
-  if (!Firebase.ready()) {
-    return false;
-  }
+  if (netAuthState != NA_READY) return false;
+  if (!Firebase.ready()) return false;
 
   unsigned long now = millis();
-  if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) {
-    return false;
-  }
-
-  if ((now - lastRoomsFetchAttemptMillis) < ROOMS_FETCH_RETRY_MS) {
-    return false;
-  }
+  if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return false;
+  if ((now - lastRoomsFetchAttemptMillis) < ROOMS_FETCH_RETRY_MS) return false;
   lastRoomsFetchAttemptMillis = now;
 
   if (!Firebase.RTDB.getJSON(&fbdo, "/rooms")) {
     String err = fbdo.errorReason();
     Serial.println("Failed to read /rooms: " + err);
-    if (isFirebaseTokenPendingError(err)) {
-      // Token generation is async; avoid reinit loops while waiting.
-      return false;
-    }
-    if (isFirebaseAuthOrSslError(err)) {
-      requestFirebaseReinit(err);
-    }
+    if (isFirebaseTokenPendingError(err)) return false;
+    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
     return false;
   }
 
@@ -118,24 +96,21 @@ bool fetchAssignedRoomFromFirebase() {
     const char* device = room["device"] | "";
     if (String(device) != String(DEVICE_ID)) continue;
 
-    fetchedRoom.found = true;
-    fetchedRoom.uid = String(kv.key().c_str());
+    fetchedRoom.found    = true;
+    fetchedRoom.uid      = String(kv.key().c_str());
     fetchedRoom.roomName = String((const char*)(room["roomName"] | ""));
-    fetchedRoom.device = String(device);
+    fetchedRoom.device   = String(device);
 
     JsonArray schedules = room["schedules"].as<JsonArray>();
     if (!schedules.isNull()) {
       for (JsonObject item : schedules) {
         if (fetchedRoom.scheduleCount >= 16) break;
-
-        String day = String((const char*)(item["day"] | ""));
+        String day       = String((const char*)(item["day"]       | ""));
         String startTime = String((const char*)(item["startTime"] | ""));
-        String endTime = String((const char*)(item["endTime"] | ""));
-
+        String endTime   = String((const char*)(item["endTime"]   | ""));
         int startMin = parseTimeToMinute(startTime);
-        int endMin = parseTimeToMinute(endTime);
+        int endMin   = parseTimeToMinute(endTime);
         if (day.length() == 0 || startMin < 0 || endMin < 0) continue;
-
         fetchedRoom.schedules[fetchedRoom.scheduleCount++] = {day, startMin, endMin};
       }
     }
@@ -155,10 +130,10 @@ bool fetchAssignedRoomFromFirebase() {
 
 void syncAcStateToFirebase() {
   String basePath = "/devices/" + String(DEVICE_ID) + "/acState";
-  Firebase.RTDB.setBool(&fbdo, basePath + "/power", acPowerState);
-  Firebase.RTDB.setInt(&fbdo, basePath + "/currentTemp", acTempState);
-  Firebase.RTDB.setString(&fbdo, basePath + "/source", acSourceState);
-  Firebase.RTDB.setString(&fbdo, basePath + "/updatedAt", nowIsoString());
+  Firebase.RTDB.setBool(&fbdo,   basePath + "/power",       acPowerState);
+  Firebase.RTDB.setInt(&fbdo,    basePath + "/currentTemp", acTempState);
+  Firebase.RTDB.setString(&fbdo, basePath + "/source",      acSourceState);
+  Firebase.RTDB.setString(&fbdo, basePath + "/updatedAt",   nowIsoString());
   if (assignedRoom.found) {
     Firebase.RTDB.setString(&fbdo, basePath + "/roomUid", assignedRoom.uid);
   }
@@ -171,11 +146,11 @@ void loadAcStateFromFirebase() {
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
 
-  if (!doc["power"].isNull()) acPowerState = doc["power"].as<bool>();
-  if (!doc["currentTemp"].isNull()) acTempState = normalizeACTemp((float)doc["currentTemp"].as<int>());
+  if (!doc["power"].isNull())       acPowerState = doc["power"].as<bool>();
+  if (!doc["currentTemp"].isNull()) acTempState  = normalizeACTemp((float)doc["currentTemp"].as<int>());
 }
 
-void applyControlJson(JsonVariant data);  // Forward declaration for use in streamCallback
+void applyControlJson(JsonVariant data);  // Forward declaration
 
 void loadControlStateFromFirebase() {
   String path = "/devices/" + String(DEVICE_ID) + "/control";
@@ -186,8 +161,7 @@ void loadControlStateFromFirebase() {
 
   bool active = false;
   if (!doc["overrideActive"].isNull()) active = doc["overrideActive"].as<bool>();
-  else if (!doc["active"].isNull()) active = doc["active"].as<bool>();
-
+  else if (!doc["active"].isNull())    active = doc["active"].as<bool>();
   manualOverrideActive = active;
 
   if (!doc["targetTemp"].isNull())
@@ -201,9 +175,32 @@ void loadControlStateFromFirebase() {
     manualOverrideUntil = "";
 
   if (!doc["power"].isNull()) manualOverridePower = doc["power"].as<bool>();
+
+  // Handle forcedOff flag that may have been set before this boot.
+  // If the flag is true in Firebase, activate forced-off state locally and
+  // immediately acknowledge (set it back to false) so it does not re-trigger
+  // on the next reboot or reconnect.
+  if (!doc["forcedOff"].isNull() && doc["forcedOff"].as<bool>()) {
+    // Mark that we are currently forced off
+    forcedOffActive = true;
+
+    // Remember whether we are already inside a schedule/pre-cool window RIGHT NOW.
+    // This lets runMinuteControl detect when a brand-new window starts.
+    forcedOffSeenWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+
+    // Cancel any live manual override so it does not fight the forced-off
+    manualOverrideActive = false;
+    manualOverrideUntil  = "";
+
+    // Acknowledge the flag in Firebase so it does not retrigger after next reboot
+    String base = "/devices/" + String(DEVICE_ID) + "/control";
+    Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
+
+    Serial.println("Startup: forcedOff=true loaded — AC will be kept off until next schedule/manual.");
+  }
 }
 
-void streamCallback(FirebaseStream data);  // Forward declaration
+void streamCallback(FirebaseStream data);       // Forward declaration
 bool applyAcState(bool targetPower, int targetTemp, const String& source);  // Forward declaration
 
 void streamCallback(FirebaseStream data) {
@@ -217,10 +214,34 @@ void streamCallback(FirebaseStream data) {
     if (deserializeJson(doc, data.stringData()) == DeserializationError::Ok) {
       JsonVariant v = doc.as<JsonVariant>();
 
+      // Handle forcedOff arriving as part of a full JSON snapshot.
+      // This fires when the whole /control node is delivered at stream open
+      // or when the UI writes multiple fields at once.
+      if (!v["forcedOff"].isNull() && v["forcedOff"].as<bool>()) {
+        // Activate forced-off state
+        forcedOffActive = true;
+
+        // Record whether we are currently inside a window so we can detect
+        // when a NEW window begins (= time to lift the forced-off block)
+        forcedOffSeenWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+
+        // Cancel any live manual override
+        manualOverrideActive = false;
+        manualOverrideUntil  = "";
+
+        Serial.println("Stream (json): forcedOff=true — turning AC off, blocking schedule/manual.");
+        applyAcState(false, acTempState, "forced_off");
+
+        // Acknowledge: set forcedOff back to false in Firebase so it does not
+        // retrigger on the next reconnect or reboot
+        String base = "/devices/" + String(DEVICE_ID) + "/control";
+        Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
+        return;
+      }
+
       bool active = false;
       if (!v["overrideActive"].isNull()) active = v["overrideActive"].as<bool>();
-      else if (!v["active"].isNull()) active = v["active"].as<bool>();
-
+      else if (!v["active"].isNull())    active = v["active"].as<bool>();
       manualOverrideActive = active;
 
       if (!v["targetTemp"].isNull())
@@ -235,8 +256,14 @@ void streamCallback(FirebaseStream data) {
 
       if (!v["power"].isNull()) manualOverridePower = v["power"].as<bool>();
 
-      // React immediately
       if (manualOverrideActive) {
+        // A new manual-ON command lifts any existing forced-off block.
+        // The user explicitly wants the AC on, so respect that intent.
+        if (forcedOffActive) {
+          forcedOffActive     = false;
+          forcedOffSeenWindow = false;
+          Serial.println("Stream (json): new manual override — clearing forcedOff.");
+        }
         Serial.println("Stream: override ON, applying immediately");
         applyAcState(true, manualOverrideTargetTemp, "manual");
       } else {
@@ -247,6 +274,30 @@ void streamCallback(FirebaseStream data) {
     return;
   }
 
+  // Handle forcedOff arriving as an individual boolean path update.
+  // This is the normal case when the UI writes only /control/forcedOff = true.
+  if (path == "/forcedOff" && type == "boolean") {
+    if (data.boolData()) {
+      // Activate forced-off
+      forcedOffActive = true;
+      forcedOffSeenWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+
+      // Cancel manual override so it does not fight the forced-off
+      manualOverrideActive = false;
+      manualOverrideUntil  = "";
+
+      Serial.println("Stream: /forcedOff=true — turning AC off, blocking schedule/manual.");
+      applyAcState(false, acTempState, "forced_off");
+
+      // Acknowledge the flag so it does not retrigger on reconnect/reboot
+      String base = "/devices/" + String(DEVICE_ID) + "/control";
+      Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
+    }
+    // If forcedOff arrives as false we do nothing — the gate is lifted by a
+    // new schedule window or a new manual override, not by clearing the flag.
+    return;
+  }
+
   if ((path == "/overrideActive" || path == "/active") && type == "boolean") {
     manualOverrideActive = data.boolData();
     if (!manualOverrideActive) {
@@ -254,6 +305,12 @@ void streamCallback(FirebaseStream data) {
       applyAcState(false, acTempState, "override_cleared");
       manualOverrideUntil = "";
     } else {
+      // A fresh manual-ON command always lifts a forced-off block.
+      if (forcedOffActive) {
+        forcedOffActive     = false;
+        forcedOffSeenWindow = false;
+        Serial.println("Stream: new manualOverride=true — clearing forcedOff.");
+      }
       Serial.println("Stream: overrideActive=true, applying override temp");
       applyAcState(true, manualOverrideTargetTemp, "manual");
     }
@@ -297,7 +354,7 @@ void ensureControlStream() {
   if (streamAttached) return;
 
   unsigned long now = millis();
-  if ((now - lastStreamRetryMillis) < 5000) return;
+  if ((now - lastStreamRetryMillis)  < 5000) return;
   if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
 
   String streamPath = "/devices/" + String(DEVICE_ID) + "/control";
@@ -305,12 +362,8 @@ void ensureControlStream() {
     String err = streamFbdo.errorReason();
     Serial.println("Control stream begin failed: " + err);
     lastStreamRetryMillis = now;
-    if (isFirebaseTokenPendingError(err)) {
-      return;
-    }
-    if (isFirebaseAuthOrSslError(err)) {
-      requestFirebaseReinit(err);
-    }
+    if (isFirebaseTokenPendingError(err)) return;
+    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
     return;
   }
 
@@ -325,8 +378,8 @@ void reconnectWiFiNonBlocking() {
     if (!wifiLinkUp) {
       wifiLinkUp = true;
       lastWiFiConnectedMillis = millis();
-      streamAttached = false;
-      startupStateLoaded = false;
+      streamAttached      = false;
+      startupStateLoaded  = false;
       firebaseInitialized = false;
       setNetAuthState(NA_WAIT_STABLE);
 
@@ -334,12 +387,13 @@ void reconnectWiFiNonBlocking() {
         wifiHasConnectedOnce = true;
       } else {
         wifiReconnectRestartPending = true;
-        wifiReconnectStableSince = millis();
+        wifiReconnectStableSince    = millis();
         Serial.println("WiFi restored, waiting stable then restarting...");
       }
     }
 
-    if (wifiReconnectRestartPending && (millis() - wifiReconnectStableSince) >= WIFI_RECONNECT_RESTART_STABLE_MS) {
+    if (wifiReconnectRestartPending &&
+        (millis() - wifiReconnectStableSince) >= WIFI_RECONNECT_RESTART_STABLE_MS) {
       Serial.println("WiFi stable after reconnect, restarting ESP...");
       delay(100);
       ESP.restart();
@@ -347,28 +401,24 @@ void reconnectWiFiNonBlocking() {
     return;
   }
 
-  if (wifiLinkUp) {
-    wifiReconnectRestartPending = false;
-  }
+  if (wifiLinkUp) wifiReconnectRestartPending = false;
 
   wifiLinkUp = false;
   setNetAuthState(NA_WAIT_WIFI);
 
-  // Avoid reconfiguring while link state is transitioning.
-  if (status == WL_IDLE_STATUS) {
-    return;
-  }
+  if (status == WL_IDLE_STATUS) return;
 
   unsigned long now = millis();
   if (now - lastWiFiReconnectAttempt < WIFI_RECONNECT_MS) return;
 
   lastWiFiReconnectAttempt = now;
-  streamAttached = false;
+  streamAttached      = false;
   firebaseInitialized = false;
-  startupStateLoaded = false;
+  startupStateLoaded  = false;
   Serial.println("WiFi disconnected, reconnecting...");
   WiFi.reconnect();
 }
+
 void initFirebaseIfNeeded() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (!wifiLinkUp) return;
@@ -376,21 +426,18 @@ void initFirebaseIfNeeded() {
   unsigned long now = millis();
 
   if (netAuthState == NA_WAIT_STABLE) {
-    if ((now - lastWiFiConnectedMillis) < WIFI_STABLE_BEFORE_FB_MS) {
-      return;
-    }
+    if ((now - lastWiFiConnectedMillis) < WIFI_STABLE_BEFORE_FB_MS) return;
     setNetAuthState(NA_AUTH_INIT);
   }
 
   if (netAuthState == NA_AUTH_INIT) {
     struct tm t;
     if (!timeIsValid(t)) return;
-
     Firebase.begin(&config, &auth);
     Firebase.reconnectNetwork(true);
     firebaseInitialized = true;
-    streamAttached = false;
-    startupStateLoaded = false;
+    streamAttached      = false;
+    startupStateLoaded  = false;
     lastFirebaseInitMillis = millis();
     Serial.println("Firebase initialized.");
     setNetAuthState(NA_AUTH_WAIT);
