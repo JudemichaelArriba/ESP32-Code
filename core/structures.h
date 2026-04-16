@@ -55,6 +55,20 @@ struct EnergyDailyCache {
   unsigned long sessionCount = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Deferred action set by streamCallback; consumed by the main loop AFTER
+// readStream() returns — prevents SSL re-entrancy crashes.
+// ---------------------------------------------------------------------------
+struct StreamPendingAction {
+  bool hasPending              = false;
+  bool power                   = false;
+  int  temp                    = 24;
+  char source[32]              = "";
+  bool writeForcedOffFalse     = false;  // write control/forcedOff = false
+  bool writeForcedOffPersisted = false;  // write control/forcedOffPersisted
+  bool forcedOffPersistedVal   = false;  // value for above
+};
+
 // Global objects
 extern DHT dht;
 extern FirebaseData fbdo;
@@ -121,11 +135,10 @@ extern String manualOverrideUntil;
 extern int manualOverrideTargetTemp;
 extern int estimatedWattsOn;
 
-
-// forcedOffActive      — true while the "OFF" button is in effect; blocks all schedule/manual logic
-// forcedOffSeenWindow  — tracks whether we were inside a window when forced off,
-//                        so we know when a genuinely NEW window starts (= safe to resume)
 extern bool forcedOffActive;
 extern bool forcedOffSeenWindow;
+
+// Deferred stream action (defined in main.ino)
+extern StreamPendingAction streamPendingAction;
 
 #endif

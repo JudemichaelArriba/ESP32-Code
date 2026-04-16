@@ -1,4 +1,3 @@
-//ac_control.h
 #ifndef AC_CONTROL_H
 #define AC_CONTROL_H
 
@@ -9,6 +8,18 @@
 
 bool applyAcState(bool targetPower, int targetTemp, const String& source);
 void applyControlJson(JsonVariant data);
+
+
+// Internal helper — fires the already-configured IR frame N times with a
+// fixed inter-burst gap so the AC unit cannot miss the command.
+static void sendIrBurst() {
+  for (uint8_t i = 0; i < IR_SEND_REPEAT_COUNT; i++) {
+    coolixAc.send();
+    if (i < IR_SEND_REPEAT_COUNT - 1) {
+      delay(IR_SEND_REPEAT_DELAY_MS);
+    }
+  }
+}
 
 // Implementation
 bool applyAcState(bool targetPower, int targetTemp, const String& source) {
@@ -27,16 +38,16 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
     coolixAc.on();
     coolixAc.setMode(kCoolixCool);
     coolixAc.setTemp(targetTemp);
-    coolixAc.send();
+    sendIrBurst();                          // <-- 5× with 100 ms gap
     acTempState = targetTemp;
-    Serial.printf("IR: AC ON %dC (%s)\n", targetTemp, source.c_str());
+    Serial.printf("IR: AC ON %dC (%s) [x%d]\n", targetTemp, source.c_str(), IR_SEND_REPEAT_COUNT);
   } else {
     coolixAc.off();
-    coolixAc.send();
-    Serial.printf("IR: AC OFF (%s)\n", source.c_str());
+    sendIrBurst();                          // <-- 5× with 100 ms gap
+    Serial.printf("IR: AC OFF (%s) [x%d]\n", source.c_str(), IR_SEND_REPEAT_COUNT);
   }
 
-  acPowerState = targetPower;
+  acPowerState  = targetPower;
   acSourceState = source;
   syncAcStateToFirebase();
   handleEnergyPowerTransition(previousPower, acPowerState, source);
@@ -47,8 +58,8 @@ void applyControlJson(JsonVariant data) {
   if (data.isNull()) return;
 
   bool hasOverride = !data["overrideActive"].isNull() || !data["active"].isNull();
-  bool hasPower = !data["power"].isNull();
-  bool hasTemp = !data["temp"].isNull();
+  bool hasPower    = !data["power"].isNull();
+  bool hasTemp     = !data["temp"].isNull();
 
   if (hasOverride) {
     if (!data["overrideActive"].isNull()) {
@@ -59,12 +70,12 @@ void applyControlJson(JsonVariant data) {
   }
 
   if (hasPower) manualOverridePower = data["power"].as<bool>();
-  if (hasTemp) manualOverrideTemp = normalizeACTemp((float)data["temp"].as<int>());
+  if (hasTemp)  manualOverrideTemp  = normalizeACTemp((float)data["temp"].as<int>());
 
   if (manualOverrideActive || hasPower || hasTemp) {
     manualOverrideActive = true;
     if (!hasPower) manualOverridePower = acPowerState || hasTemp;
-    if (!hasTemp) manualOverrideTemp = acTempState;
+    if (!hasTemp)  manualOverrideTemp  = acTempState;
     applyAcState(manualOverridePower, manualOverrideTemp, "manual");
   }
 }

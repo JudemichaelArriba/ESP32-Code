@@ -66,12 +66,19 @@ void refreshSensorsAndOccupancy() {
     float temperature = dht.readTemperature();
 
     if (!isnan(humidity) && !isnan(temperature)) {
-      lastHumidity = humidity;
-      lastTemperature = temperature;
+      // Only push to Firebase if the temperature changed by 0.2C or humidity by 1.0%.
+      // This stops the ESP32 from spamming the network and overflowing the SSL buffer!
+      if (isnan(lastTemperature) || isnan(lastHumidity) || 
+          abs(lastTemperature - temperature) > 0.2 || 
+          abs(lastHumidity - humidity) > 1.0) {
+          
+        lastHumidity = humidity;
+        lastTemperature = temperature;
 
-      String basePath = "/devices/" + String(DEVICE_ID);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
-      Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+        String basePath = "/devices/" + String(DEVICE_ID);
+        Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
+        Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+      }
     }
   }
 
@@ -106,12 +113,20 @@ bool forceReadDhtNow() {
   if (isnan(humidity) || isnan(temperature)) return false;
 
   lastDhtReadMillis = millis();
-  lastHumidity = humidity;
-  lastTemperature = temperature;
+  
+  // [NEW FIX]: Same bandwidth-saving logic applied here to prevent SSL crashes.
+  if (isnan(lastTemperature) || isnan(lastHumidity) || 
+      abs(lastTemperature - temperature) > 0.2 || 
+      abs(lastHumidity - humidity) > 1.0) {
+        
+    lastHumidity = humidity;
+    lastTemperature = temperature;
 
-  String basePath = "/devices/" + String(DEVICE_ID);
-  Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
-  Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+    String basePath = "/devices/" + String(DEVICE_ID);
+    Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
+    Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+  }
+  
   return true;
 }
 
@@ -176,6 +191,3 @@ bool callRenderMLAndGetTarget(int& targetTempOut) {
 }
 
 #endif
-
-
-

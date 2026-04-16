@@ -1,3 +1,4 @@
+// ESP32-Code.ino
 #include "core/structures.h"
 #include "functions/utility_functions.h"
 #include "functions/firebase_functions.h"
@@ -42,7 +43,7 @@ bool manualOverrideActive = false;
 bool manualOverridePower  = false;
 int  manualOverrideTemp   = 24;
 
-bool streamAttached     = false;
+bool streamAttached      = false;
 bool firebaseInitialized = false;
 bool startupStateLoaded  = false;
 
@@ -72,15 +73,11 @@ int    estimatedWattsOn        = DEFAULT_ESTIMATED_WATTS_ON;
 
 const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
 
-// forcedOff state variables (definitions — externs declared in structures.h)
-// forcedOffActive     : true = OFF button was pressed; block all schedule/manual logic
-// forcedOffSeenWindow : true = we were inside a schedule/pre-cool window at the time
-//                       of the press; cleared when we leave that window so the NEXT
-//                       window is treated as brand-new and automatically resumes.
-bool forcedOffActive    = false;
+bool forcedOffActive     = false;
 bool forcedOffSeenWindow = false;
 
-
+// Deferred action populated by streamCallback, consumed by the main loop.
+StreamPendingAction streamPendingAction;
 
 void logScheduleModeChange(const String& mode) {
   if (lastScheduleMode == mode) return;
@@ -104,41 +101,29 @@ void runMinuteControl(const struct tm& t) {
 
   const bool inAnyWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
 
-
-  // When forcedOffActive is true we keep the AC off and ignore every
-  // schedule / pre-cool / manual trigger.  The gate is lifted only when:
-  //   (a) We have LEFT the window that was active when forced off (so
-  //       forcedOffSeenWindow is cleared), AND a NEW window has started — this
-  //       means the next scheduled period will resume automatically, OR
-  //   (b) The user sends a new manual override ON command (handled in
-  //       streamCallback, which clears forcedOffActive before we reach here).
   if (forcedOffActive) {
     if (inAnyWindow) {
       if (!forcedOffSeenWindow) {
-        // We have exited the old window and just entered a brand-new one
-        // lift the forced-off block and fall through to normal logic below.
-        forcedOffActive    = false;
+        // Genuinely new schedule window — resume normal control and clear persistence.
+        forcedOffActive     = false;
         forcedOffSeenWindow = false;
+        clearForcedOffPersistedInFirebase();
         Serial.println("ForcedOff: new schedule window detected — resuming normal control.");
-        // fall through intentionally
+        // Fall through to normal schedule logic below.
       } else {
-        // Still inside (or back inside) the SAME window that was forced off
-        // stay off, do nothing.
         logScheduleModeChange("FORCED_OFF");
         applyAcState(false, acTempState, "forced_off");
         return;
       }
     } else {
-      // Outside any window mark that we have fully left the forced-off window.
-      // The next time inAnyWindow becomes true it will be a new window.
-      forcedOffSeenWindow = false;   // clear so next window is fresh
+      // Outside any window: reset the "seen" flag so the next window is treated as new.
+      forcedOffSeenWindow = false;
       logScheduleModeChange("FORCED_OFF");
       applyAcState(false, acTempState, "forced_off");
       disableSensorsAndOccupancyIfIdle();
       return;
     }
   }
-  
 
   if (!currentScheduleStatus.inSchedule) {
     wasInScheduleWindow = false;
@@ -230,8 +215,8 @@ void checkMinuteTickAndRunControl() {
   int minuteStamp = t.tm_yday * 1440 + t.tm_hour * 60 + t.tm_min;
 
   if (!minuteGateInitialized) {
-    minuteGateInitialized    = true;
-    lastCheckedMinuteStamp   = minuteStamp - 1;
+    minuteGateInitialized  = true;
+    lastCheckedMinuteStamp = minuteStamp - 1;
   }
 
   if (minuteStamp == lastCheckedMinuteStamp) return;
@@ -304,6 +289,16 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+
+  Serial.print("Waiting for NTP time sync...");
+  struct tm timeinfo;
+  int retry = 0;
+  while (!getLocalTime(&timeinfo) && retry < 20) {
+    Serial.print(".");
+    delay(500);
+    retry++;
+  }
+  Serial.println("\nTime synced.");
 }
 
 void loop() {
@@ -330,10 +325,32 @@ void loop() {
       }
     }
 
+    //Process deferred stream action
+    // Must run AFTER readStream() has fully returned to avoid SSL re-entrancy.
+    if (streamPendingAction.hasPending) {
+      StreamPendingAction act = streamPendingAction;  // copy
+      streamPendingAction     = StreamPendingAction(); // clear immediately
+
+      // Write order: forcedOffPersisted first, then forcedOff=false.
+      // If the ESP crashes between the two writes, forcedOffPersisted=true
+      // ensures the next boot still recovers the forced-off state correctly.
+      if (act.writeForcedOffPersisted) {
+        String base = "/devices/" + String(DEVICE_ID) + "/control";
+        Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", act.forcedOffPersistedVal);
+      }
+      if (act.writeForcedOffFalse) {
+        String base = "/devices/" + String(DEVICE_ID) + "/control";
+        Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
+      }
+
+      applyAcState(act.power, act.temp, String(act.source));
+    }
+
+
     if (!startupStateLoaded) {
       if (fetchAssignedRoomFromFirebase()) {
         loadAcStateFromFirebase();
-        loadControlStateFromFirebase();   // forcedOff is read & acknowledged here
+        loadControlStateFromFirebase();
         loadEnergyProfileFromFirebase();
         loadEnergyStateFromFirebase();
         syncAcStateToFirebase();
@@ -343,7 +360,7 @@ void loop() {
 
         struct tm t;
         if (timeIsValid(t)) {
-          runMinuteControl(t);            // forcedOff gate is active from here if loaded
+          runMinuteControl(t);
         }
       }
     }
