@@ -79,6 +79,8 @@ bool forcedOffSeenWindow = false;
 // Deferred action populated by streamCallback, consumed by the main loop.
 StreamPendingAction streamPendingAction;
 
+extern unsigned long lastEspControlWriteMillis; // Imported from firebase_functions.h
+
 void logScheduleModeChange(const String& mode) {
   if (lastScheduleMode == mode) return;
   lastScheduleMode = mode;
@@ -99,34 +101,56 @@ void runMinuteControl(const struct tm& t) {
 
   currentScheduleStatus = evaluateScheduleStatus(t);
 
+  // --------------------------------------------------------------------------
+  // FIX: Track schedule entry securely at the very top to ignore early returns
+  // --------------------------------------------------------------------------
+  static bool isFirstMinuteRun = true;
+  bool justEnteredSchedule = false;
+
+  if (isFirstMinuteRun) {
+    wasInScheduleWindow = currentScheduleStatus.inSchedule;
+    if (wasInScheduleWindow) {
+      scheduleWindowEnteredMillis = millis();
+    }
+    isFirstMinuteRun = false;
+  } else {
+    if (currentScheduleStatus.inSchedule && !wasInScheduleWindow) {
+      wasInScheduleWindow = true;
+      scheduleWindowEnteredMillis = millis();
+      justEnteredSchedule = true;
+    } else if (!currentScheduleStatus.inSchedule) {
+      wasInScheduleWindow = false;
+    }
+  }
+
   const bool inAnyWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
 
   if (forcedOffActive) {
-    if (inAnyWindow) {
+    if (justEnteredSchedule) {
+      // The exact schedule block just started. Resume normal control.
+      forcedOffActive     = false;
+      forcedOffSeenWindow = false;
+      clearForcedOffPersistedInFirebase();
+      Serial.println("ForcedOff: exact schedule started — resuming normal control.");
+    }
+    else if (inAnyWindow) {
       if (!forcedOffSeenWindow) {
-        // Genuinely new schedule window — resume normal control and clear persistence.
         forcedOffActive     = false;
         forcedOffSeenWindow = false;
         clearForcedOffPersistedInFirebase();
         Serial.println("ForcedOff: new schedule window detected — resuming normal control.");
-        // Fall through to normal schedule logic below.
       } else {
         logScheduleModeChange("FORCED_OFF");
         applyAcState(false, acTempState, "forced_off");
         return;
       }
     } else {
-      // Outside any window: reset the "seen" flag so the next window is treated as new.
       forcedOffSeenWindow = false;
       logScheduleModeChange("FORCED_OFF");
       applyAcState(false, acTempState, "forced_off");
       disableSensorsAndOccupancyIfIdle();
       return;
     }
-  }
-
-  if (!currentScheduleStatus.inSchedule) {
-    wasInScheduleWindow = false;
   }
 
   if (!currentScheduleStatus.hasScheduleToday) {
@@ -168,11 +192,6 @@ void runMinuteControl(const struct tm& t) {
 
   logScheduleModeChange("SCHEDULE");
   unsigned long nowMs = millis();
-
-  if (!wasInScheduleWindow) {
-    wasInScheduleWindow = true;
-    scheduleWindowEnteredMillis = nowMs;
-  }
 
   unsigned long emptyReferenceMillis = scheduleWindowEnteredMillis;
   if (lastPresenceDetectedMillis > emptyReferenceMillis) {
@@ -319,28 +338,25 @@ void loop() {
       streamAttached = false;
       Firebase.RTDB.endStream(&streamFbdo);
       if (isFirebaseTokenPendingError(err)) {
-        // Let token mint/refresh finish — do not reset session
       } else if (isFirebaseAuthOrSslError(err)) {
         requestFirebaseReinit(err);
       }
     }
 
-    //Process deferred stream action
-    // Must run AFTER readStream() has fully returned to avoid SSL re-entrancy.
     if (streamPendingAction.hasPending) {
-      StreamPendingAction act = streamPendingAction;  // copy
-      streamPendingAction     = StreamPendingAction(); // clear immediately
+      StreamPendingAction act = streamPendingAction;  
+      streamPendingAction     = StreamPendingAction(); 
 
-      // Write order: forcedOffPersisted first, then forcedOff=false.
-      // If the ESP crashes between the two writes, forcedOffPersisted=true
-      // ensures the next boot still recovers the forced-off state correctly.
       if (act.writeForcedOffPersisted) {
         String base = "/devices/" + String(DEVICE_ID) + "/control";
+        lastEspControlWriteMillis = millis(); // Debounce stream echo
         Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", act.forcedOffPersistedVal);
       }
       if (act.writeForcedOffFalse) {
         String base = "/devices/" + String(DEVICE_ID) + "/control";
+        lastEspControlWriteMillis = millis(); // Debounce stream echo
         Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
+        Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
       }
 
       applyAcState(act.power, act.temp, String(act.source));
