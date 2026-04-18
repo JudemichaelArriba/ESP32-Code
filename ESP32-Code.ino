@@ -102,7 +102,7 @@ void runMinuteControl(const struct tm& t) {
   currentScheduleStatus = evaluateScheduleStatus(t);
 
   // --------------------------------------------------------------------------
-  // FIX: Track schedule entry securely at the very top to ignore early returns
+  // Track schedule entry securely at the very top to ignore early returns
   // --------------------------------------------------------------------------
   static bool isFirstMinuteRun = true;
   bool justEnteredSchedule = false;
@@ -333,15 +333,8 @@ void loop() {
   if (firebaseInitialized && Firebase.ready()) {
     ensureControlStream();
 
-    if (streamAttached && !Firebase.RTDB.readStream(&streamFbdo)) {
-      String err = streamFbdo.errorReason();
-      streamAttached = false;
-      Firebase.RTDB.endStream(&streamFbdo);
-      if (isFirebaseTokenPendingError(err)) {
-      } else if (isFirebaseAuthOrSslError(err)) {
-        requestFirebaseReinit(err);
-      }
-    }
+    // FIX: Removed the conflicting readStream() polling block.
+    // The background task now runs freely without being interrupted.
 
     if (streamPendingAction.hasPending) {
       StreamPendingAction act = streamPendingAction;  
@@ -361,7 +354,6 @@ void loop() {
 
       applyAcState(act.power, act.temp, String(act.source));
     }
-
 
     if (!startupStateLoaded) {
       if (fetchAssignedRoomFromFirebase()) {

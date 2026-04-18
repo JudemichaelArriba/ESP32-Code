@@ -46,10 +46,15 @@ bool isFirebaseRevokedError(const String& err) {
   return err.indexOf("revoked") >= 0 || err.indexOf("expired") >= 0;
 }
 
+// Catch a broader range of network/SSL failures so the client actually resets
 bool isFirebaseAuthOrSslError(const String& err) {
   return isFirebaseRevokedError(err) ||
          err.indexOf("ssl") >= 0 ||
-         err.indexOf("SSL") >= 0;
+         err.indexOf("SSL") >= 0 ||
+         err.indexOf("not connected") >= 0 ||
+         err.indexOf("connection") >= 0 ||
+         err.indexOf("TCP") >= 0 ||
+         err.indexOf("closed") >= 0;
 }
 
 void requestFirebaseReinit(const String& reason) {
@@ -395,12 +400,10 @@ void streamCallback(FirebaseStream data) {
   }
 }
 
+// FIX: Let the Firebase library auto-resume the stream. Do NOT end it here!
 void streamTimeoutCallback(bool timeout) {
   if (timeout) {
-    streamAttached        = false;
-    lastStreamRetryMillis = millis();
-    Firebase.RTDB.endStream(&streamFbdo);
-    Serial.println("Firebase stream timeout, retry pending.");
+    Serial.println("Firebase stream timeout, auto-resuming...");
   }
 }
 
@@ -490,8 +493,9 @@ void initFirebaseIfNeeded() {
   }
 
   if (netAuthState == NA_AUTH_INIT) {
-    fbdo.setBSSLBufferSize(4096, 1024);
-    streamFbdo.setBSSLBufferSize(4096, 1024);
+    // Bump BSSL buffer slightly to give the SSL engine more breathing room
+    fbdo.setBSSLBufferSize(8192, 2048);
+    streamFbdo.setBSSLBufferSize(8192, 2048);
     config.timeout.socketConnection = 10000;
 
     Firebase.begin(&config, &auth);
