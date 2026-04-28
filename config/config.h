@@ -33,7 +33,7 @@ const int PRECOOL_MINUTES = 10;
 const int PRECOOL_TEMP = 17;
 const int DEFAULT_ESTIMATED_WATTS_ON = 950;
 const uint8_t  IR_SEND_REPEAT_COUNT    = 5;
-const uint16_t IR_SEND_REPEAT_DELAY_MS = 100;  
+const uint16_t IR_SEND_REPEAT_DELAY_MS = 200;  
 #endif
 
 

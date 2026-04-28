@@ -10,8 +10,6 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source);
 void applyControlJson(JsonVariant data);
 
 
-// Internal helper — fires the already-configured IR frame N times with a
-// fixed inter-burst gap so the AC unit cannot miss the command.
 static void sendIrBurst() {
   for (uint8_t i = 0; i < IR_SEND_REPEAT_COUNT; i++) {
     coolixAc.send();
@@ -21,7 +19,7 @@ static void sendIrBurst() {
   }
 }
 
-// Implementation
+
 bool applyAcState(bool targetPower, int targetTemp, const String& source) {
   targetTemp = normalizeACTemp((float)targetTemp);
   bool previousPower = acPowerState;
@@ -36,14 +34,16 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
 
   if (targetPower) {
     coolixAc.on();
-    coolixAc.setMode(kCoolixCool);
+    coolixAc.setFan(kCoolixFanAuto); // Explicitly set a valid fan state
+    coolixAc.setMode(kCoolixCool);   // Explicitly set mode
     coolixAc.setTemp(targetTemp);
-    sendIrBurst();                          // <-- 5× with 100 ms gap
+    sendIrBurst();                          
     acTempState = targetTemp;
     Serial.printf("IR: AC ON %dC (%s) [x%d]\n", targetTemp, source.c_str(), IR_SEND_REPEAT_COUNT);
   } else {
-    coolixAc.off();
-    sendIrBurst();                          // <-- 5× with 100 ms gap
+
+    coolixAc.off();?
+    sendIrBurst();                          
     Serial.printf("IR: AC OFF (%s) [x%d]\n", source.c_str(), IR_SEND_REPEAT_COUNT);
   }
 

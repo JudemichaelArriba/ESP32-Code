@@ -1,4 +1,3 @@
-// ESP32-Code.ino
 #include "core/structures.h"
 #include "functions/utility_functions.h"
 #include "functions/firebase_functions.h"
@@ -101,9 +100,7 @@ void runMinuteControl(const struct tm& t) {
 
   currentScheduleStatus = evaluateScheduleStatus(t);
 
-  // --------------------------------------------------------------------------
   // Track schedule entry securely at the very top to ignore early returns
-  // --------------------------------------------------------------------------
   static bool isFirstMinuteRun = true;
   bool justEnteredSchedule = false;
 
@@ -127,7 +124,6 @@ void runMinuteControl(const struct tm& t) {
 
   if (forcedOffActive) {
     if (justEnteredSchedule) {
-      // The exact schedule block just started. Resume normal control.
       forcedOffActive     = false;
       forcedOffSeenWindow = false;
       clearForcedOffPersistedInFirebase();
@@ -289,7 +285,15 @@ void setup() {
   Serial.begin(115200);
 
   dht.begin();
+  
+  // Force Coolix AC library to construct a fully valid 24-bit state block 
+  // right at boot, preventing garbage data on the first turn-off command.
   coolixAc.begin();
+  coolixAc.on(); 
+  coolixAc.setFan(kCoolixFanAuto);
+  coolixAc.setMode(kCoolixCool);
+  coolixAc.setTemp(acTempState);
+  coolixAc.off();
 
   pinMode(PIR_PIN, PIR_ACTIVE_HIGH ? INPUT_PULLDOWN : INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIR_PIN), onPirMotion, PIR_ACTIVE_HIGH ? RISING : FALLING);
@@ -333,21 +337,18 @@ void loop() {
   if (firebaseInitialized && Firebase.ready()) {
     ensureControlStream();
 
-    // FIX: Removed the conflicting readStream() polling block.
-    // The background task now runs freely without being interrupted.
-
     if (streamPendingAction.hasPending) {
       StreamPendingAction act = streamPendingAction;  
       streamPendingAction     = StreamPendingAction(); 
 
       if (act.writeForcedOffPersisted) {
         String base = "/devices/" + String(DEVICE_ID) + "/control";
-        lastEspControlWriteMillis = millis(); // Debounce stream echo
+        lastEspControlWriteMillis = millis(); 
         Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", act.forcedOffPersistedVal);
       }
       if (act.writeForcedOffFalse) {
         String base = "/devices/" + String(DEVICE_ID) + "/control";
-        lastEspControlWriteMillis = millis(); // Debounce stream echo
+        lastEspControlWriteMillis = millis(); 
         Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
         Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
       }
