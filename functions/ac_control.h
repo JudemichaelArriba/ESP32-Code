@@ -4,13 +4,34 @@
 #include "../core/structures.h"
 #include "utility_functions.h"
 #include "firebase_functions.h"
+#include "energy_functions.h"
 
 bool applyAcState(bool targetPower, int targetTemp, const String& source);
 void applyControlJson(JsonVariant data);
 
-// Implementation
+
+static void sendIrBurst() {
+  for (uint8_t i = 0; i < IR_SEND_REPEAT_COUNT; i++) {
+    coolixAc.send();
+    if (i < IR_SEND_REPEAT_COUNT - 1) {
+      delay(IR_SEND_REPEAT_DELAY_MS);
+    }
+  }
+}
+
+static void sendOffIrBurst() {
+  for (uint8_t i = 0; i < IR_SEND_REPEAT_COUNT; i++) {
+    coolixAc.off();
+    coolixAc.send();
+    if (i < IR_SEND_REPEAT_COUNT - 1) {
+      delay(IR_SEND_REPEAT_DELAY_MS);
+    }
+  }
+}
+
 bool applyAcState(bool targetPower, int targetTemp, const String& source) {
   targetTemp = normalizeACTemp((float)targetTemp);
+  bool previousPower = acPowerState;
 
   if (targetPower == acPowerState && (!targetPower || targetTemp == acTempState)) {
     if (acSourceState != source) {
@@ -22,20 +43,23 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
 
   if (targetPower) {
     coolixAc.on();
-    coolixAc.setMode(kCoolixCool);
+    coolixAc.setFan(kCoolixFanAuto); // Explicitly set a valid fan state
+    coolixAc.setMode(kCoolixCool);   // Explicitly set mode
     coolixAc.setTemp(targetTemp);
-    coolixAc.send();
+    sendIrBurst();                          
     acTempState = targetTemp;
-    Serial.printf("IR: AC ON %dC (%s)\n", targetTemp, source.c_str());
+    Serial.printf("IR: AC ON %dC (%s) [x%d]\n", targetTemp, source.c_str(), IR_SEND_REPEAT_COUNT);
   } else {
-    coolixAc.off();
-    coolixAc.send();
-    Serial.printf("IR: AC OFF (%s)\n", source.c_str());
+
+  sendOffIrBurst();
+  Serial.printf("IR: AC OFF (%s) [x%d]\n", source.c_str(), IR_SEND_REPEAT_COUNT);
+
   }
 
-  acPowerState = targetPower;
+  acPowerState  = targetPower;
   acSourceState = source;
   syncAcStateToFirebase();
+  handleEnergyPowerTransition(previousPower, acPowerState, source);
   return true;
 }
 
@@ -43,8 +67,8 @@ void applyControlJson(JsonVariant data) {
   if (data.isNull()) return;
 
   bool hasOverride = !data["overrideActive"].isNull() || !data["active"].isNull();
-  bool hasPower = !data["power"].isNull();
-  bool hasTemp = !data["temp"].isNull();
+  bool hasPower    = !data["power"].isNull();
+  bool hasTemp     = !data["temp"].isNull();
 
   if (hasOverride) {
     if (!data["overrideActive"].isNull()) {
@@ -55,12 +79,12 @@ void applyControlJson(JsonVariant data) {
   }
 
   if (hasPower) manualOverridePower = data["power"].as<bool>();
-  if (hasTemp) manualOverrideTemp = normalizeACTemp((float)data["temp"].as<int>());
+  if (hasTemp)  manualOverrideTemp  = normalizeACTemp((float)data["temp"].as<int>());
 
   if (manualOverrideActive || hasPower || hasTemp) {
     manualOverrideActive = true;
     if (!hasPower) manualOverridePower = acPowerState || hasTemp;
-    if (!hasTemp) manualOverrideTemp = acTempState;
+    if (!hasTemp)  manualOverrideTemp  = acTempState;
     applyAcState(manualOverridePower, manualOverrideTemp, "manual");
   }
 }

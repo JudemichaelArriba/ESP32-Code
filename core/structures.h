@@ -1,3 +1,4 @@
+// structures.h
 #ifndef STRUCTURES_H
 #define STRUCTURES_H
 
@@ -37,6 +38,38 @@ struct ScheduleStatus {
   bool inSchedule = false;
 };
 
+struct EnergyRuntimeState {
+  bool active = false;
+  String roomUid;
+  String sessionStartedAt;
+  String lastFlushAt;
+  String lastSource;
+  String dateKey;
+};
+
+struct EnergyDailyCache {
+  bool loaded = false;
+  String dateKey;
+  String roomUid;
+  unsigned long runtimeSeconds = 0;
+  float estimatedKwh = 0.0f;
+  unsigned long sessionCount = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Deferred action set by streamCallback; consumed by the main loop AFTER
+// readStream() returns — prevents SSL re-entrancy crashes.
+// ---------------------------------------------------------------------------
+struct StreamPendingAction {
+  bool hasPending              = false;
+  bool power                   = false;
+  int  temp                    = 24;
+  char source[32]              = "";
+  bool writeForcedOffFalse     = false;  // write control/forcedOff = false
+  bool writeForcedOffPersisted = false;  // write control/forcedOffPersisted
+  bool forcedOffPersistedVal   = false;  // value for above
+};
+
 // Global objects
 extern DHT dht;
 extern FirebaseData fbdo;
@@ -49,16 +82,21 @@ extern IRCoolixAC coolixAc;
 // Global variables
 extern RoomConfig assignedRoom;
 extern ScheduleStatus currentScheduleStatus;
+extern EnergyRuntimeState energyRuntimeState;
+extern EnergyDailyCache energyDailyCache;
 
 extern float lastHumidity;
 extern float lastTemperature;
 extern float mlxObjectTemp;
 extern float mlxAmbientTemp;
+extern float mlxDeltaTemp;
 
 extern bool pirMotionDetected;
 extern bool mlxPresenceDetected;
 extern bool presenceDetected;
 extern bool lastPresenceReported;
+extern uint8_t mlxPositiveReadStreak;
+extern uint8_t mlxNegativeReadStreak;
 
 extern volatile bool pirMotionLatched;
 extern volatile unsigned long lastPirInterruptMillis;
@@ -97,6 +135,14 @@ extern String lastScheduleMode;
 extern uint8_t netAuthState;
 extern unsigned long netAuthStateSince;
 
+extern String manualOverrideUntil;
+extern int manualOverrideTargetTemp;
+extern int estimatedWattsOn;
+
+extern bool forcedOffActive;
+extern bool forcedOffSeenWindow;
+
+// Deferred stream action (defined in main.ino)
+extern StreamPendingAction streamPendingAction;
+
 #endif
-
-
