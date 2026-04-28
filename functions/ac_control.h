@@ -19,6 +19,15 @@ static void sendIrBurst() {
   }
 }
 
+static void sendOffIrBurst() {
+  for (uint8_t i = 0; i < IR_SEND_REPEAT_COUNT; i++) {
+    coolixAc.off();
+    coolixAc.send();
+    if (i < IR_SEND_REPEAT_COUNT - 1) {
+      delay(IR_SEND_REPEAT_DELAY_MS);
+    }
+  }
+}
 
 bool applyAcState(bool targetPower, int targetTemp, const String& source) {
   targetTemp = normalizeACTemp((float)targetTemp);
@@ -42,9 +51,9 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
     Serial.printf("IR: AC ON %dC (%s) [x%d]\n", targetTemp, source.c_str(), IR_SEND_REPEAT_COUNT);
   } else {
 
-    coolixAc.off();?
-    sendIrBurst();                          
-    Serial.printf("IR: AC OFF (%s) [x%d]\n", source.c_str(), IR_SEND_REPEAT_COUNT);
+  sendOffIrBurst();
+  Serial.printf("IR: AC OFF (%s) [x%d]\n", source.c_str(), IR_SEND_REPEAT_COUNT);
+
   }
 
   acPowerState  = targetPower;

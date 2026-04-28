@@ -37,6 +37,11 @@ static void setNetAuthState(uint8_t s) {
   netAuthStateSince = millis();
 }
 
+static bool resolveManualOverridePower(JsonVariant data, const bool overrideActive) {
+  if (!data["power"].isNull()) return data["power"].as<bool>();
+  return overrideActive;
+}
+
 bool isFirebaseTokenPendingError(const String& err) {
   return err.indexOf("token is not ready") >= 0;
 }
@@ -175,25 +180,26 @@ void loadControlStateFromFirebase() {
 
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
+  JsonVariant control = doc.as<JsonVariant>();
 
   bool active = false;
-  if (!doc["overrideActive"].isNull()) active = doc["overrideActive"].as<bool>();
-  else if (!doc["active"].isNull())    active = doc["active"].as<bool>();
+  if (!control["overrideActive"].isNull()) active = control["overrideActive"].as<bool>();
+  else if (!control["active"].isNull())    active = control["active"].as<bool>();
   manualOverrideActive = active;
 
-  if (!doc["targetTemp"].isNull())
-    manualOverrideTargetTemp = normalizeACTemp((float)doc["targetTemp"].as<int>());
-  else if (!doc["temp"].isNull())
-    manualOverrideTargetTemp = normalizeACTemp((float)doc["temp"].as<int>());
+  if (!control["targetTemp"].isNull())
+    manualOverrideTargetTemp = normalizeACTemp((float)control["targetTemp"].as<int>());
+  else if (!control["temp"].isNull())
+    manualOverrideTargetTemp = normalizeACTemp((float)control["temp"].as<int>());
 
-  if (!doc["overrideUntil"].isNull())
-    manualOverrideUntil = doc["overrideUntil"].as<String>();
+  if (!control["overrideUntil"].isNull())
+    manualOverrideUntil = control["overrideUntil"].as<String>();
   else
     manualOverrideUntil = "";
 
-  if (!doc["power"].isNull()) manualOverridePower = doc["power"].as<bool>();
+  manualOverridePower = resolveManualOverridePower(control, manualOverrideActive);
 
-  if (!doc["forcedOff"].isNull() && doc["forcedOff"].as<bool>()) {
+  if (!control["forcedOff"].isNull() && control["forcedOff"].as<bool>()) {
     forcedOffActive      = true;
     forcedOffSeenWindow  = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
     manualOverrideActive = false;
@@ -206,7 +212,7 @@ void loadControlStateFromFirebase() {
     return;
   }
 
-  if (!doc["forcedOffPersisted"].isNull() && doc["forcedOffPersisted"].as<bool>()) {
+  if (!control["forcedOffPersisted"].isNull() && control["forcedOffPersisted"].as<bool>()) {
     if (!forcedOffActive) {
       forcedOffActive      = true;
       forcedOffSeenWindow  = true;   // Wait for a completely new window after restart
@@ -275,7 +281,7 @@ void streamCallback(FirebaseStream data) {
     if (!v["overrideUntil"].isNull())
       manualOverrideUntil = v["overrideUntil"].as<String>();
 
-    if (!v["power"].isNull()) manualOverridePower = v["power"].as<bool>();
+    manualOverridePower = resolveManualOverridePower(v, manualOverrideActive);
 
     if (manualOverrideActive) {
       // Override is ON (new or refreshed) — apply immediately
@@ -287,7 +293,7 @@ void streamCallback(FirebaseStream data) {
         Serial.println("Stream (json): manual override — clearing forcedOff.");
       }
       streamPendingAction.hasPending = true;
-      streamPendingAction.power      = true;
+      streamPendingAction.power      = manualOverridePower;
       streamPendingAction.temp       = manualOverrideTargetTemp;
       strncpy(streamPendingAction.source, "manual", sizeof(streamPendingAction.source) - 1);
       Serial.println("Stream (json): override ON — deferred apply queued.");
@@ -338,6 +344,7 @@ void streamCallback(FirebaseStream data) {
     manualOverrideActive = data.boolData();
 
     if (manualOverrideActive) {
+      manualOverridePower = true;
       // Override turned ON
       if (forcedOffActive) {
         forcedOffActive      = false;
@@ -347,7 +354,7 @@ void streamCallback(FirebaseStream data) {
         Serial.println("Stream: manual override=true — clearing forcedOff.");
       }
       streamPendingAction.hasPending = true;
-      streamPendingAction.power      = true;
+      streamPendingAction.power      = manualOverridePower;
       streamPendingAction.temp       = manualOverrideTargetTemp;
       strncpy(streamPendingAction.source, "manual", sizeof(streamPendingAction.source) - 1);
       Serial.println("Stream: overrideActive=true — deferred apply queued.");
@@ -375,8 +382,9 @@ void streamCallback(FirebaseStream data) {
   if (path == "/targetTemp" && (type == "int" || type == "float" || type == "double")) {
     manualOverrideTargetTemp = normalizeACTemp((float)data.floatData());
     if (manualOverrideActive) {
+      if (!manualOverridePower) manualOverridePower = true;
       streamPendingAction.hasPending = true;
-      streamPendingAction.power      = true;
+      streamPendingAction.power      = manualOverridePower;
       streamPendingAction.temp       = manualOverrideTargetTemp;
       strncpy(streamPendingAction.source, "manual", sizeof(streamPendingAction.source) - 1);
     }

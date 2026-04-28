@@ -152,7 +152,7 @@ void runMinuteControl(const struct tm& t) {
   if (!currentScheduleStatus.hasScheduleToday) {
     if (manualOverrideActive) {
       logScheduleModeChange("MANUAL_OVERRIDE");
-      applyAcState(true, manualOverrideTargetTemp, "manual");
+      applyAcState(manualOverridePower, manualOverrideTargetTemp, "manual");
       return;
     }
     logScheduleModeChange("NO_SCHEDULE_TODAY");
@@ -163,7 +163,7 @@ void runMinuteControl(const struct tm& t) {
 
   if (manualOverrideActive && !inAnyWindow) {
     logScheduleModeChange("MANUAL_OVERRIDE");
-    applyAcState(true, manualOverrideTargetTemp, "manual");
+    applyAcState(manualOverridePower, manualOverrideTargetTemp, "manual");
     return;
   }
 
@@ -176,7 +176,7 @@ void runMinuteControl(const struct tm& t) {
 
   if (manualOverrideActive) {
     logScheduleModeChange("MANUAL_OVERRIDE");
-    applyAcState(true, manualOverrideTargetTemp, "manual");
+    applyAcState(manualOverridePower, manualOverrideTargetTemp, "manual");
     return;
   }
 
