@@ -11,7 +11,11 @@ const char* NTP_SERVER = "pool.ntp.org";
 const long GMT_OFFSET_SEC = 8 * 3600;
 const int DAYLIGHT_OFFSET_SEC = 0;
 
-const float occupancyThreshold = 30.0f;
+const float MLX_HUMAN_OBJECT_MIN_C = 30.0f;
+const float MLX_HUMAN_OBJECT_MAX_C = 40.0f;
+const float MLX_HUMAN_DELTA_MIN_C = 2.0f;
+const uint8_t MLX_CONFIRM_READS = 2;
+const uint8_t MLX_CLEAR_READS = 2;
 const bool PIR_ACTIVE_HIGH = true;
 const unsigned long PIR_RETRIGGER_GUARD_MS = 80;
 const unsigned long PIR_HOLD_MS = 3UL * 60UL * 1000UL;
@@ -35,5 +39,4 @@ const int DEFAULT_ESTIMATED_WATTS_ON = 950;
 const uint8_t  IR_SEND_REPEAT_COUNT    = 5;
 const uint16_t IR_SEND_REPEAT_DELAY_MS = 200;  
 #endif
-
 

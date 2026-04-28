@@ -23,11 +23,14 @@ float lastHumidity    = NAN;
 float lastTemperature = NAN;
 float mlxObjectTemp   = NAN;
 float mlxAmbientTemp  = NAN;
+float mlxDeltaTemp    = NAN;
 
 bool pirMotionDetected    = false;
 bool mlxPresenceDetected  = false;
 bool presenceDetected     = false;
 bool lastPresenceReported = true;
+uint8_t mlxPositiveReadStreak = 0;
+uint8_t mlxNegativeReadStreak = 0;
 
 volatile bool pirMotionLatched             = false;
 volatile unsigned long lastPirInterruptMillis = 0;

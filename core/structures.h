@@ -89,11 +89,14 @@ extern float lastHumidity;
 extern float lastTemperature;
 extern float mlxObjectTemp;
 extern float mlxAmbientTemp;
+extern float mlxDeltaTemp;
 
 extern bool pirMotionDetected;
 extern bool mlxPresenceDetected;
 extern bool presenceDetected;
 extern bool lastPresenceReported;
+extern uint8_t mlxPositiveReadStreak;
+extern uint8_t mlxNegativeReadStreak;
 
 extern volatile bool pirMotionLatched;
 extern volatile unsigned long lastPirInterruptMillis;

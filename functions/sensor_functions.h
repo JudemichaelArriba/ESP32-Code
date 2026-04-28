@@ -14,13 +14,64 @@ bool callRenderMLAndGetTarget(int& targetTempOut);
 // Implementation
 void pushOccupancyIfChanged() {
   if (lastPresenceReported == presenceDetected) return;
+
+  const unsigned long now = millis();
+  const bool pirRecentMotion = (lastPirMotionMillis != 0) &&
+                               ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
+  Serial.printf("Occupancy: %s [pir=%d recent=%d mlx=%d obj=%.1f amb=%.1f delta=%.1f]\n",
+                presenceDetected ? "true" : "false",
+                pirMotionDetected,
+                pirRecentMotion,
+                mlxPresenceDetected,
+                mlxObjectTemp,
+                mlxAmbientTemp,
+                mlxDeltaTemp);
+
   lastPresenceReported = presenceDetected;
 
   String basePath = "/devices/" + String(DEVICE_ID);
   Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
 }
 
-void refreshOccupancyOnly() {
+static void updateMlxPresenceFilter(const bool mlxHumanLikeNow) {
+  if (mlxHumanLikeNow) {
+    if (mlxPositiveReadStreak < 255) mlxPositiveReadStreak++;
+    mlxNegativeReadStreak = 0;
+    if (mlxPositiveReadStreak >= MLX_CONFIRM_READS) {
+      mlxPresenceDetected = true;
+    }
+    return;
+  }
+
+  mlxPositiveReadStreak = 0;
+  if (mlxNegativeReadStreak < 255) mlxNegativeReadStreak++;
+  if (mlxNegativeReadStreak >= MLX_CLEAR_READS) {
+    mlxPresenceDetected = false;
+  }
+}
+
+static void refreshMlxPresenceIfDue(const unsigned long now) {
+  if ((now - lastMlxReadMillis) >= MLX_INTERVAL_MS || lastMlxReadMillis == 0) {
+    lastMlxReadMillis = now;
+    mlxObjectTemp = mlx.readObjectTempC();
+    mlxAmbientTemp = mlx.readAmbientTempC();
+
+    if (!isnan(mlxObjectTemp) && !isnan(mlxAmbientTemp)) {
+      mlxDeltaTemp = mlxObjectTemp - mlxAmbientTemp;
+    } else {
+      mlxDeltaTemp = NAN;
+    }
+
+    const bool mlxHumanLikeNow = !isnan(mlxObjectTemp) &&
+                                 !isnan(mlxAmbientTemp) &&
+                                 mlxObjectTemp >= MLX_HUMAN_OBJECT_MIN_C &&
+                                 mlxObjectTemp <= MLX_HUMAN_OBJECT_MAX_C &&
+                                 mlxDeltaTemp >= MLX_HUMAN_DELTA_MIN_C;
+    updateMlxPresenceFilter(mlxHumanLikeNow);
+  }
+}
+
+static void refreshOccupancyState() {
   const unsigned long now = millis();
 
   if (pirMotionLatched) {
@@ -30,35 +81,25 @@ void refreshOccupancyOnly() {
 
   const bool pirRawActive = PIR_ACTIVE_HIGH ? (digitalRead(PIR_PIN) == HIGH) : (digitalRead(PIR_PIN) == LOW);
   pirMotionDetected = pirRawActive;
-
-  if ((now - lastMlxReadMillis) >= MLX_INTERVAL_MS || lastMlxReadMillis == 0) {
-    lastMlxReadMillis = now;
-    mlxObjectTemp = mlx.readObjectTempC();
-    mlxAmbientTemp = mlx.readAmbientTempC();
-    mlxPresenceDetected = !isnan(mlxObjectTemp) && (mlxObjectTemp > occupancyThreshold);
-  }
+  refreshMlxPresenceIfDue(now);
 
   const bool pirRecentMotion = (lastPirMotionMillis != 0) && ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
-  const bool anyDetected = mlxPresenceDetected || pirRawActive || pirRecentMotion;
+  const bool anyDetected = pirRawActive || pirRecentMotion || mlxPresenceDetected;
 
   if (anyDetected) {
     lastPresenceDetectedMillis = now;
   }
 
   presenceDetected = (lastPresenceDetectedMillis != 0) && ((now - lastPresenceDetectedMillis) <= PIR_HOLD_MS);
+}
+
+void refreshOccupancyOnly() {
+  refreshOccupancyState();
   pushOccupancyIfChanged();
 }
 
 void refreshSensorsAndOccupancy() {
   const unsigned long now = millis();
-
-  if (pirMotionLatched) {
-    pirMotionLatched = false;
-    lastPirMotionMillis = now;
-  }
-
-  const bool pirRawActive = PIR_ACTIVE_HIGH ? (digitalRead(PIR_PIN) == HIGH) : (digitalRead(PIR_PIN) == LOW);
-  pirMotionDetected = pirRawActive;
 
   if ((now - lastDhtReadMillis) >= DHT_INTERVAL_MS || lastDhtReadMillis == 0) {
     lastDhtReadMillis = now;
@@ -82,25 +123,16 @@ void refreshSensorsAndOccupancy() {
     }
   }
 
-  if ((now - lastMlxReadMillis) >= MLX_INTERVAL_MS || lastMlxReadMillis == 0) {
-    lastMlxReadMillis = now;
-    mlxObjectTemp = mlx.readObjectTempC();
-    mlxAmbientTemp = mlx.readAmbientTempC();
-    mlxPresenceDetected = !isnan(mlxObjectTemp) && (mlxObjectTemp > occupancyThreshold);
-  }
-
-  const bool pirRecentMotion = (lastPirMotionMillis != 0) && ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
-  const bool anyDetected = mlxPresenceDetected || pirRawActive || pirRecentMotion;
-
-  if (anyDetected) {
-    lastPresenceDetectedMillis = now;
-  }
-
-  presenceDetected = (lastPresenceDetectedMillis != 0) && ((now - lastPresenceDetectedMillis) <= PIR_HOLD_MS);
+  refreshOccupancyState();
   pushOccupancyIfChanged();
 }
 
 void disableSensorsAndOccupancyIfIdle() {
+  pirMotionDetected = false;
+  mlxPresenceDetected = false;
+  mlxPositiveReadStreak = 0;
+  mlxNegativeReadStreak = 0;
+  mlxDeltaTemp = NAN;
   presenceDetected = false;
   lastPresenceDetectedMillis = 0;
   pushOccupancyIfChanged();
