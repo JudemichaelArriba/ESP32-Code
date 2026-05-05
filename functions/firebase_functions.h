@@ -42,6 +42,40 @@ static bool resolveManualOverridePower(JsonVariant data, const bool overrideActi
   return overrideActive;
 }
 
+static bool currentScheduleWindowIsActive() {
+  return (currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule) &&
+         currentScheduleStatus.windowKey.length() > 0;
+}
+
+static String currentForcedOffWindowKey() {
+  if (!currentScheduleWindowIsActive()) return String("");
+  return currentScheduleStatus.windowKey;
+}
+
+static void copyStringToBuffer(const String& value, char* buffer, size_t bufferSize) {
+  if (bufferSize == 0) return;
+  strncpy(buffer, value.c_str(), bufferSize - 1);
+  buffer[bufferSize - 1] = '\0';
+}
+
+static void queueForcedOffPersistence(bool persisted, const String& windowKey) {
+  streamPendingAction.writeForcedOffPersisted = true;
+  streamPendingAction.forcedOffPersistedVal = persisted && windowKey.length() > 0;
+  streamPendingAction.writeForcedOffWindowKey = true;
+  copyStringToBuffer(windowKey, streamPendingAction.forcedOffWindowKey,
+                     sizeof(streamPendingAction.forcedOffWindowKey));
+}
+
+static void setForcedOffForCurrentWindow() {
+  forcedOffWindowKey = currentForcedOffWindowKey();
+  forcedOffActive = forcedOffWindowKey.length() > 0;
+}
+
+static void clearForcedOffLocal() {
+  forcedOffActive = false;
+  forcedOffWindowKey = "";
+}
+
 bool isFirebaseTokenPendingError(const String& err) {
   return err.indexOf("token is not ready") >= 0;
 }
@@ -82,11 +116,13 @@ void setControlStateToFirebase(bool active) {
 }
 
 void clearForcedOffPersistedInFirebase() {
+  clearForcedOffLocal();
   if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   String base = "/devices/" + String(DEVICE_ID) + "/control";
   lastEspControlWriteMillis = millis();
   Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", false);
-  Serial.println("forcedOffPersisted cleared in Firebase.");
+  Firebase.RTDB.setString(&fbdo, base + "/forcedOffWindowKey", "");
+  Serial.println("forcedOff persistence cleared in Firebase.");
 }
 
 bool fetchAssignedRoomFromFirebase() {
@@ -153,13 +189,20 @@ bool fetchAssignedRoomFromFirebase() {
 }
 
 void syncAcStateToFirebase() {
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
+
   String basePath = "/devices/" + String(DEVICE_ID) + "/acState";
-  Firebase.RTDB.setBool(&fbdo,   basePath + "/power",       acPowerState);
-  Firebase.RTDB.setInt(&fbdo,    basePath + "/currentTemp", acTempState);
-  Firebase.RTDB.setString(&fbdo, basePath + "/source",      acSourceState);
-  Firebase.RTDB.setString(&fbdo, basePath + "/updatedAt",   nowIsoString());
+  FirebaseJson json;
+  json.set("power", acPowerState);
+  json.set("currentTemp", acTempState);
+  json.set("source", acSourceState);
+  json.set("updatedAt", nowIsoString());
   if (assignedRoom.found) {
-    Firebase.RTDB.setString(&fbdo, basePath + "/roomUid", assignedRoom.uid);
+    json.set("roomUid", assignedRoom.uid);
+  }
+
+  if (!Firebase.RTDB.setJSON(&fbdo, basePath, &json)) {
+    Serial.println("Failed to sync acState: " + fbdo.errorReason());
   }
 }
 
@@ -172,6 +215,7 @@ void loadAcStateFromFirebase() {
 
   if (!doc["power"].isNull())       acPowerState = doc["power"].as<bool>();
   if (!doc["currentTemp"].isNull()) acTempState  = normalizeACTemp((float)doc["currentTemp"].as<int>());
+  acIrStateTrusted = false;
 }
 
 void loadControlStateFromFirebase() {
@@ -199,32 +243,53 @@ void loadControlStateFromFirebase() {
 
   manualOverridePower = resolveManualOverridePower(control, manualOverrideActive);
 
-  if (!control["forcedOff"].isNull() && control["forcedOff"].as<bool>()) {
-    forcedOffActive      = true;
-    forcedOffSeenWindow  = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+  String persistedWindowKey = "";
+  if (!control["forcedOffWindowKey"].isNull()) {
+    persistedWindowKey = control["forcedOffWindowKey"].as<String>();
+  }
+
+  const bool hasForcedOffTrigger = !control["forcedOff"].isNull() &&
+                                   control["forcedOff"].as<bool>();
+  const bool hasForcedOffPersisted = !control["forcedOffPersisted"].isNull() &&
+                                     control["forcedOffPersisted"].as<bool>();
+
+  if (hasForcedOffTrigger) {
+    setForcedOffForCurrentWindow();
     manualOverrideActive = false;
-    manualOverrideUntil  = "";
+    manualOverrideUntil = "";
 
     String base = "/devices/" + String(DEVICE_ID) + "/control";
-    Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", true);
-    Firebase.RTDB.setBool(&fbdo, base + "/forcedOff",          false);
-    Serial.println("Startup: forcedOff=true — persisted and cleared trigger.");
+    lastEspControlWriteMillis = millis();
+    Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", forcedOffActive);
+    Firebase.RTDB.setString(&fbdo, base + "/forcedOffWindowKey", forcedOffWindowKey);
+    Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
+    Serial.println("Startup: forcedOff=true processed for window key: " + forcedOffWindowKey);
     return;
   }
 
-  if (!control["forcedOffPersisted"].isNull() && control["forcedOffPersisted"].as<bool>()) {
-    if (!forcedOffActive) {
-      forcedOffActive      = true;
-      forcedOffSeenWindow  = true;   // Wait for a completely new window after restart
+  if (hasForcedOffPersisted) {
+    String currentKey = currentForcedOffWindowKey();
+    if (persistedWindowKey.length() > 0 && persistedWindowKey == currentKey) {
+      forcedOffActive = true;
+      forcedOffWindowKey = persistedWindowKey;
       manualOverrideActive = false;
-      manualOverrideUntil  = "";
-      Serial.println("Startup: forcedOffPersisted=true — AC held off until new schedule window.");
+      manualOverrideUntil = "";
+      Serial.println("Startup: forcedOff persisted for current window.");
+    } else {
+      clearForcedOffPersistedInFirebase();
+      Serial.println("Startup: stale forcedOff persistence cleared.");
     }
+    return;
+  }
+
+  if (persistedWindowKey.length() > 0) {
+    clearForcedOffPersistedInFirebase();
   }
 }
 
 void streamCallback(FirebaseStream data);
 bool applyAcState(bool targetPower, int targetTemp, const String& source);
+bool applyAcState(bool targetPower, int targetTemp, const String& source, bool forceIr);
 
 void streamCallback(FirebaseStream data) {
   const String path = data.dataPath();
@@ -241,7 +306,7 @@ void streamCallback(FirebaseStream data) {
 
   streamPendingAction = StreamPendingAction();
 
-  // ── JSON snapshot of the whole /control node ─────────────────────────────
+  // JSON snapshot of the whole /control node.
   if (type == "json") {
     DynamicJsonDocument doc(512);
     if (deserializeJson(doc, data.stringData()) != DeserializationError::Ok) return;
@@ -249,8 +314,7 @@ void streamCallback(FirebaseStream data) {
 
     // forcedOff trigger takes priority over everything else
     if (!v["forcedOff"].isNull() && v["forcedOff"].as<bool>()) {
-      forcedOffActive      = true;
-      forcedOffSeenWindow  = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+      setForcedOffForCurrentWindow();
       manualOverrideActive = false;
       manualOverrideUntil  = "";
 
@@ -258,10 +322,9 @@ void streamCallback(FirebaseStream data) {
       streamPendingAction.power                   = false;
       streamPendingAction.temp                    = acTempState;
       strncpy(streamPendingAction.source, "forced_off", sizeof(streamPendingAction.source) - 1);
-      streamPendingAction.writeForcedOffPersisted = true;
-      streamPendingAction.forcedOffPersistedVal   = true;
+      queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
       streamPendingAction.writeForcedOffFalse     = true;
-      Serial.println("Stream (json): forcedOff=true — deferred apply + Firebase writes queued.");
+      Serial.println("Stream (json): forcedOff=true queued for window key: " + forcedOffWindowKey);
       return;
     }
 
@@ -284,33 +347,29 @@ void streamCallback(FirebaseStream data) {
     manualOverridePower = resolveManualOverridePower(v, manualOverrideActive);
 
     if (manualOverrideActive) {
-      // Override is ON (new or refreshed) — apply immediately
+      // Override is ON (new or refreshed), so apply immediately.
       if (forcedOffActive) {
-        forcedOffActive      = false;
-        forcedOffSeenWindow  = false;
-        streamPendingAction.writeForcedOffPersisted = true;
-        streamPendingAction.forcedOffPersistedVal   = false;
-        Serial.println("Stream (json): manual override — clearing forcedOff.");
+        clearForcedOffLocal();
+        queueForcedOffPersistence(false, "");
+        Serial.println("Stream (json): manual override clearing forcedOff.");
       }
       streamPendingAction.hasPending = true;
       streamPendingAction.power      = manualOverridePower;
       streamPendingAction.temp       = manualOverrideTargetTemp;
       strncpy(streamPendingAction.source, "manual", sizeof(streamPendingAction.source) - 1);
-      Serial.println("Stream (json): override ON — deferred apply queued.");
+      Serial.println("Stream (json): override ON queued.");
 
     } else if (previousOverrideActive) {
-      // Override was ON and has just been turned OFF — intentional user action.
+      // Override was ON and has just been turned OFF by the user.
       // Queue AC off and lock out the current session via forcedOff.
       streamPendingAction.hasPending = true;
       streamPendingAction.power      = false;
       streamPendingAction.temp       = acTempState;
       strncpy(streamPendingAction.source, "override_cleared", sizeof(streamPendingAction.source) - 1);
 
-      forcedOffActive     = true;
-      forcedOffSeenWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
-      streamPendingAction.writeForcedOffPersisted = true;
-      streamPendingAction.forcedOffPersistedVal   = true;
-      Serial.println("Stream (json): User turned off manual override — forcing off current session.");
+      setForcedOffForCurrentWindow();
+      queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
+      Serial.println("Stream (json): manual override off queued forcedOff key: " + forcedOffWindowKey);
 
     }
     // If override was already off and remains off, take no action.
@@ -318,12 +377,11 @@ void streamCallback(FirebaseStream data) {
     return;
   }
 
-  // ── Individual field updates ──────────────────────────────────────────────
+  // Individual field updates.
 
   if (path == "/forcedOff" && type == "boolean") {
     if (data.boolData()) {
-      forcedOffActive      = true;
-      forcedOffSeenWindow  = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+      setForcedOffForCurrentWindow();
       manualOverrideActive = false;
       manualOverrideUntil  = "";
 
@@ -331,10 +389,9 @@ void streamCallback(FirebaseStream data) {
       streamPendingAction.power                   = false;
       streamPendingAction.temp                    = acTempState;
       strncpy(streamPendingAction.source, "forced_off", sizeof(streamPendingAction.source) - 1);
-      streamPendingAction.writeForcedOffPersisted = true;
-      streamPendingAction.forcedOffPersistedVal   = true;
+      queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
       streamPendingAction.writeForcedOffFalse     = true;
-      Serial.println("Stream: /forcedOff=true — deferred apply + Firebase writes queued.");
+      Serial.println("Stream: /forcedOff=true queued for window key: " + forcedOffWindowKey);
     }
     return;
   }
@@ -347,17 +404,15 @@ void streamCallback(FirebaseStream data) {
       manualOverridePower = true;
       // Override turned ON
       if (forcedOffActive) {
-        forcedOffActive      = false;
-        forcedOffSeenWindow  = false;
-        streamPendingAction.writeForcedOffPersisted = true;
-        streamPendingAction.forcedOffPersistedVal   = false;
-        Serial.println("Stream: manual override=true — clearing forcedOff.");
+        clearForcedOffLocal();
+        queueForcedOffPersistence(false, "");
+        Serial.println("Stream: manual override=true clearing forcedOff.");
       }
       streamPendingAction.hasPending = true;
       streamPendingAction.power      = manualOverridePower;
       streamPendingAction.temp       = manualOverrideTargetTemp;
       strncpy(streamPendingAction.source, "manual", sizeof(streamPendingAction.source) - 1);
-      Serial.println("Stream: overrideActive=true — deferred apply queued.");
+      Serial.println("Stream: overrideActive=true queued.");
 
     } else if (previousOverrideActive) {
       // Override explicitly turned OFF (was previously ON)
@@ -368,14 +423,12 @@ void streamCallback(FirebaseStream data) {
       streamPendingAction.temp       = acTempState;
       strncpy(streamPendingAction.source, "override_cleared", sizeof(streamPendingAction.source) - 1);
 
-      forcedOffActive     = true;
-      forcedOffSeenWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
-      streamPendingAction.writeForcedOffPersisted = true;
-      streamPendingAction.forcedOffPersistedVal   = true;
-      Serial.println("Stream: User turned off manual override — forcing off current session.");
+      setForcedOffForCurrentWindow();
+      queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
+      Serial.println("Stream: manual override off queued forcedOff key: " + forcedOffWindowKey);
 
     }
-    // If already off → no action; schedule controller owns the state.
+    // If already off, no action; schedule controller owns the state.
     return;
   }
 

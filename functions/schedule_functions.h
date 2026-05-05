@@ -9,6 +9,26 @@ ScheduleStatus evaluateScheduleStatus(const struct tm& t);
 bool shouldPollSensors();
 
 // Implementation
+static String normalizedScheduleDay(const String& scheduleDay) {
+  String day = scheduleDay;
+  day.trim();
+  day.toLowerCase();
+  return day;
+}
+
+static String makeScheduleWindowKey(const ScheduleSlot& slot, const struct tm& t) {
+  String key = assignedRoom.uid;
+  key += "|";
+  key += dateKeyFromTm(t);
+  key += "|";
+  key += normalizedScheduleDay(slot.day);
+  key += "|";
+  key += String(slot.startMinute);
+  key += "|";
+  key += String(slot.endMinute);
+  return key;
+}
+
 ScheduleStatus evaluateScheduleStatus(const struct tm& t) {
   ScheduleStatus status;
 
@@ -26,10 +46,14 @@ ScheduleStatus evaluateScheduleStatus(const struct tm& t) {
 
     if (isWithinMinuteRange(nowMinute, preCoolStart, s.startMinute)) {
       status.inPreCool = true;
+      if (status.windowKey.length() == 0) {
+        status.windowKey = makeScheduleWindowKey(s, t);
+      }
     }
 
     if (isWithinMinuteRange(nowMinute, s.startMinute, s.endMinute)) {
       status.inSchedule = true;
+      status.windowKey = makeScheduleWindowKey(s, t);
     }
   }
 

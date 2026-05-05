@@ -5,6 +5,7 @@
 #include "../core/structures.h"
 
 void pushOccupancyIfChanged();
+bool pushOccupancyToFirebase(bool force);
 void refreshOccupancyOnly();
 void refreshSensorsAndOccupancy();
 void disableSensorsAndOccupancyIfIdle();
@@ -12,25 +13,41 @@ bool forceReadDhtNow();
 bool callRenderMLAndGetTarget(int& targetTempOut);
 
 // Implementation
-void pushOccupancyIfChanged() {
-  if (lastPresenceReported == presenceDetected) return;
+static bool canWriteSensorDataToFirebase() {
+  return firebaseInitialized && WiFi.status() == WL_CONNECTED && Firebase.ready();
+}
+
+static void markSensorWindowActive() {
+  sensorWindowActive = true;
+  idleOccupancyPublished = false;
+}
+
+bool pushOccupancyToFirebase(bool force) {
+  if (!force && lastPresenceReported == presenceDetected) return true;
 
   const unsigned long now = millis();
   const bool pirRecentMotion = (lastPirMotionMillis != 0) &&
                                ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
-  Serial.printf("Occupancy: %s [pir=%d recent=%d mlx=%d obj=%.1f amb=%.1f delta=%.1f]\n",
-                presenceDetected ? "true" : "false",
-                pirMotionDetected,
-                pirRecentMotion,
-                mlxPresenceDetected,
-                mlxObjectTemp,
-                mlxAmbientTemp,
-                mlxDeltaTemp);
+  if (lastPresenceReported != presenceDetected) {
+    Serial.printf("Occupancy: %s [pir=%d recent=%d mlx=%d obj=%.1f amb=%.1f delta=%.1f]\n",
+                  presenceDetected ? "true" : "false",
+                  pirMotionDetected,
+                  pirRecentMotion,
+                  mlxPresenceDetected,
+                  mlxObjectTemp,
+                  mlxAmbientTemp,
+                  mlxDeltaTemp);
+  }
 
   lastPresenceReported = presenceDetected;
+  if (!canWriteSensorDataToFirebase()) return false;
 
   String basePath = "/devices/" + String(DEVICE_ID);
-  Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
+  return Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
+}
+
+void pushOccupancyIfChanged() {
+  pushOccupancyToFirebase(false);
 }
 
 static void updateMlxPresenceFilter(const bool mlxHumanLikeNow) {
@@ -94,11 +111,13 @@ static void refreshOccupancyState() {
 }
 
 void refreshOccupancyOnly() {
+  markSensorWindowActive();
   refreshOccupancyState();
   pushOccupancyIfChanged();
 }
 
 void refreshSensorsAndOccupancy() {
+  markSensorWindowActive();
   const unsigned long now = millis();
 
   if ((now - lastDhtReadMillis) >= DHT_INTERVAL_MS || lastDhtReadMillis == 0) {
@@ -109,13 +128,14 @@ void refreshSensorsAndOccupancy() {
     if (!isnan(humidity) && !isnan(temperature)) {
       // Only push to Firebase if the temperature changed by 0.2C or humidity by 1.0%.
       // This stops the ESP32 from spamming the network and overflowing the SSL buffer!
-      if (isnan(lastTemperature) || isnan(lastHumidity) || 
-          abs(lastTemperature - temperature) > 0.2 || 
-          abs(lastHumidity - humidity) > 1.0) {
-          
-        lastHumidity = humidity;
-        lastTemperature = temperature;
+      bool shouldPublish = isnan(lastTemperature) || isnan(lastHumidity) ||
+                           abs(lastTemperature - temperature) > 0.2 ||
+                           abs(lastHumidity - humidity) > 1.0;
 
+      lastHumidity = humidity;
+      lastTemperature = temperature;
+
+      if (shouldPublish && canWriteSensorDataToFirebase()) {
         String basePath = "/devices/" + String(DEVICE_ID);
         Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
         Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
@@ -128,14 +148,24 @@ void refreshSensorsAndOccupancy() {
 }
 
 void disableSensorsAndOccupancyIfIdle() {
+  pirMotionLatched = false;
   pirMotionDetected = false;
   mlxPresenceDetected = false;
   mlxPositiveReadStreak = 0;
   mlxNegativeReadStreak = 0;
+  mlxObjectTemp = NAN;
+  mlxAmbientTemp = NAN;
   mlxDeltaTemp = NAN;
   presenceDetected = false;
+  lastPirMotionMillis = 0;
   lastPresenceDetectedMillis = 0;
-  pushOccupancyIfChanged();
+  lastDhtReadMillis = 0;
+  lastMlxReadMillis = 0;
+  sensorWindowActive = false;
+  if (idleOccupancyPublished) return;
+  if (pushOccupancyToFirebase(true)) {
+    idleOccupancyPublished = true;
+  }
 }
 
 bool forceReadDhtNow() {
@@ -147,13 +177,14 @@ bool forceReadDhtNow() {
   lastDhtReadMillis = millis();
   
   // [NEW FIX]: Same bandwidth-saving logic applied here to prevent SSL crashes.
-  if (isnan(lastTemperature) || isnan(lastHumidity) || 
-      abs(lastTemperature - temperature) > 0.2 || 
-      abs(lastHumidity - humidity) > 1.0) {
-        
-    lastHumidity = humidity;
-    lastTemperature = temperature;
+  bool shouldPublish = isnan(lastTemperature) || isnan(lastHumidity) ||
+                       abs(lastTemperature - temperature) > 0.2 ||
+                       abs(lastHumidity - humidity) > 1.0;
 
+  lastHumidity = humidity;
+  lastTemperature = temperature;
+
+  if (shouldPublish && canWriteSensorDataToFirebase()) {
     String basePath = "/devices/" + String(DEVICE_ID);
     Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
     Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);

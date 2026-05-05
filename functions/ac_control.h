@@ -1,3 +1,4 @@
+// ac_Control
 #ifndef AC_CONTROL_H
 #define AC_CONTROL_H
 
@@ -7,6 +8,7 @@
 #include "energy_functions.h"
 
 bool applyAcState(bool targetPower, int targetTemp, const String& source);
+bool applyAcState(bool targetPower, int targetTemp, const String& source, bool forceIr);
 void applyControlJson(JsonVariant data);
 
 
@@ -30,10 +32,16 @@ static void sendOffIrBurst() {
 }
 
 bool applyAcState(bool targetPower, int targetTemp, const String& source) {
+  return applyAcState(targetPower, targetTemp, source, false);
+}
+
+bool applyAcState(bool targetPower, int targetTemp, const String& source, bool forceIr) {
   targetTemp = normalizeACTemp((float)targetTemp);
   bool previousPower = acPowerState;
+  bool sameState = targetPower == acPowerState && (!targetPower || targetTemp == acTempState);
+  bool shouldSendIr = forceIr || !acIrStateTrusted || !sameState;
 
-  if (targetPower == acPowerState && (!targetPower || targetTemp == acTempState)) {
+  if (sameState && !shouldSendIr) {
     if (acSourceState != source) {
       acSourceState = source;
       syncAcStateToFirebase();
@@ -46,16 +54,15 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
     coolixAc.setFan(kCoolixFanAuto); // Explicitly set a valid fan state
     coolixAc.setMode(kCoolixCool);   // Explicitly set mode
     coolixAc.setTemp(targetTemp);
-    sendIrBurst();                          
+    sendIrBurst();
     acTempState = targetTemp;
     Serial.printf("IR: AC ON %dC (%s) [x%d]\n", targetTemp, source.c_str(), IR_SEND_REPEAT_COUNT);
   } else {
-
-  sendOffIrBurst();
-  Serial.printf("IR: AC OFF (%s) [x%d]\n", source.c_str(), IR_SEND_REPEAT_COUNT);
-
+    sendOffIrBurst();
+    Serial.printf("IR: AC OFF (%s) [x%d]\n", source.c_str(), IR_SEND_REPEAT_COUNT);
   }
 
+  acIrStateTrusted = true;
   acPowerState  = targetPower;
   acSourceState = source;
   syncAcStateToFirebase();
@@ -79,13 +86,19 @@ void applyControlJson(JsonVariant data) {
   }
 
   if (hasPower) manualOverridePower = data["power"].as<bool>();
-  if (hasTemp)  manualOverrideTemp  = normalizeACTemp((float)data["temp"].as<int>());
+  if (hasTemp) {
+    manualOverrideTemp = normalizeACTemp((float)data["temp"].as<int>());
+    manualOverrideTargetTemp = manualOverrideTemp;
+  }
 
   if (manualOverrideActive || hasPower || hasTemp) {
     manualOverrideActive = true;
     if (!hasPower) manualOverridePower = acPowerState || hasTemp;
-    if (!hasTemp)  manualOverrideTemp  = acTempState;
-    applyAcState(manualOverridePower, manualOverrideTemp, "manual");
+    if (!hasTemp) {
+      manualOverrideTemp = acTempState;
+      manualOverrideTargetTemp = acTempState;
+    }
+    applyAcState(manualOverridePower, manualOverrideTargetTemp, "manual");
   }
 }
 

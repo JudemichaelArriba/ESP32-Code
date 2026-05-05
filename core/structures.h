@@ -36,6 +36,7 @@ struct ScheduleStatus {
   bool hasScheduleToday = false;
   bool inPreCool = false;
   bool inSchedule = false;
+  String windowKey;
 };
 
 struct EnergyRuntimeState {
@@ -58,7 +59,7 @@ struct EnergyDailyCache {
 
 // ---------------------------------------------------------------------------
 // Deferred action set by streamCallback; consumed by the main loop AFTER
-// readStream() returns — prevents SSL re-entrancy crashes.
+// readStream() returns - prevents SSL re-entrancy crashes.
 // ---------------------------------------------------------------------------
 struct StreamPendingAction {
   bool hasPending              = false;
@@ -68,6 +69,8 @@ struct StreamPendingAction {
   bool writeForcedOffFalse     = false;  // write control/forcedOff = false
   bool writeForcedOffPersisted = false;  // write control/forcedOffPersisted
   bool forcedOffPersistedVal   = false;  // value for above
+  bool writeForcedOffWindowKey = false;  // write control/forcedOffWindowKey
+  char forcedOffWindowKey[96]  = "";
 };
 
 // Global objects
@@ -106,6 +109,7 @@ extern unsigned long lastPresenceDetectedMillis;
 extern bool acPowerState;
 extern int acTempState;
 extern String acSourceState;
+extern bool acIrStateTrusted;
 
 extern bool manualOverrideActive;
 extern bool manualOverridePower;
@@ -131,6 +135,7 @@ extern bool wifiHasConnectedOnce;
 extern bool wifiReconnectRestartPending;
 extern unsigned long wifiReconnectStableSince;
 extern String lastScheduleMode;
+extern String lastScheduleWindowKey;
 
 extern uint8_t netAuthState;
 extern unsigned long netAuthStateSince;
@@ -140,7 +145,9 @@ extern int manualOverrideTargetTemp;
 extern int estimatedWattsOn;
 
 extern bool forcedOffActive;
-extern bool forcedOffSeenWindow;
+extern String forcedOffWindowKey;
+extern bool idleOccupancyPublished;
+extern bool sensorWindowActive;
 
 // Deferred stream action (defined in main.ino)
 extern StreamPendingAction streamPendingAction;

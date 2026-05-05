@@ -1,3 +1,4 @@
+//ESP32-Code.ino
 #include "core/structures.h"
 #include "functions/utility_functions.h"
 #include "functions/firebase_functions.h"
@@ -40,6 +41,7 @@ unsigned long lastPresenceDetectedMillis   = 0;
 bool   acPowerState  = false;
 int    acTempState   = 24;
 String acSourceState = "boot";
+bool   acIrStateTrusted = false;
 
 bool manualOverrideActive = false;
 bool manualOverridePower  = false;
@@ -69,14 +71,18 @@ unsigned long netAuthStateSince = 0;
 String lastScheduleMode        = "boot";
 bool   wasInScheduleWindow     = false;
 unsigned long scheduleWindowEnteredMillis = 0;
+String lastActiveWindowKey     = "";
+String lastScheduleWindowKey   = "";
 String manualOverrideUntil     = "";
 int    manualOverrideTargetTemp = 24;
 int    estimatedWattsOn        = DEFAULT_ESTIMATED_WATTS_ON;
 
 const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
 
-bool forcedOffActive     = false;
-bool forcedOffSeenWindow = false;
+bool forcedOffActive = false;
+String forcedOffWindowKey = "";
+bool idleOccupancyPublished = false;
+bool sensorWindowActive = false;
 
 // Deferred action populated by streamCallback, consumed by the main loop.
 StreamPendingAction streamPendingAction;
@@ -103,53 +109,71 @@ void runMinuteControl(const struct tm& t) {
 
   currentScheduleStatus = evaluateScheduleStatus(t);
 
-  // Track schedule entry securely at the very top to ignore early returns
+  // Track window and schedule entry before any controller branch can return.
   static bool isFirstMinuteRun = true;
   bool justEnteredSchedule = false;
+  bool justEnteredWindow = false;
+  const bool inAnyWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
+  const String activeWindowKey = inAnyWindow ? currentScheduleStatus.windowKey : String("");
+  const bool inScheduleWindow = currentScheduleStatus.inSchedule &&
+                                currentScheduleStatus.windowKey.length() > 0;
+  const String scheduleWindowKey = inScheduleWindow ? currentScheduleStatus.windowKey : String("");
+  unsigned long nowMs = millis();
 
   if (isFirstMinuteRun) {
-    wasInScheduleWindow = currentScheduleStatus.inSchedule;
-    if (wasInScheduleWindow) {
-      scheduleWindowEnteredMillis = millis();
+    if (activeWindowKey.length() > 0) {
+      justEnteredWindow = true;
     }
+    lastActiveWindowKey = activeWindowKey;
+
+    if (inScheduleWindow) {
+      justEnteredSchedule = true;
+      scheduleWindowEnteredMillis = nowMs;
+      lastScheduleWindowKey = scheduleWindowKey;
+      Serial.println("Schedule window entered: " + scheduleWindowKey);
+    } else {
+      lastScheduleWindowKey = "";
+    }
+
+    wasInScheduleWindow = currentScheduleStatus.inSchedule;
     isFirstMinuteRun = false;
   } else {
-    if (currentScheduleStatus.inSchedule && !wasInScheduleWindow) {
-      wasInScheduleWindow = true;
-      scheduleWindowEnteredMillis = millis();
+    if (activeWindowKey.length() > 0 && activeWindowKey != lastActiveWindowKey) {
+      justEnteredWindow = true;
+      lastActiveWindowKey = activeWindowKey;
+    } else if (activeWindowKey.length() == 0 && lastActiveWindowKey.length() > 0) {
+      lastActiveWindowKey = "";
+    }
+
+    if (inScheduleWindow && scheduleWindowKey != lastScheduleWindowKey) {
       justEnteredSchedule = true;
+      scheduleWindowEnteredMillis = nowMs;
+      lastScheduleWindowKey = scheduleWindowKey;
+      Serial.println("Schedule window entered: " + scheduleWindowKey);
+    } else if (!inScheduleWindow && lastScheduleWindowKey.length() > 0) {
+      lastScheduleWindowKey = "";
+    }
+
+    if (currentScheduleStatus.inSchedule) {
+      wasInScheduleWindow = true;
     } else if (!currentScheduleStatus.inSchedule) {
       wasInScheduleWindow = false;
     }
   }
 
-  const bool inAnyWindow = currentScheduleStatus.inPreCool || currentScheduleStatus.inSchedule;
-
   if (forcedOffActive) {
-    if (justEnteredSchedule) {
-      forcedOffActive     = false;
-      forcedOffSeenWindow = false;
+    if (!inAnyWindow || forcedOffWindowKey.length() == 0 || forcedOffWindowKey != activeWindowKey) {
       clearForcedOffPersistedInFirebase();
-      Serial.println("ForcedOff: exact schedule started — resuming normal control.");
-    }
-    else if (inAnyWindow) {
-      if (!forcedOffSeenWindow) {
-        forcedOffActive     = false;
-        forcedOffSeenWindow = false;
-        clearForcedOffPersistedInFirebase();
-        Serial.println("ForcedOff: new schedule window detected — resuming normal control.");
-      } else {
-        logScheduleModeChange("FORCED_OFF");
-        applyAcState(false, acTempState, "forced_off");
-        return;
-      }
+      Serial.println("ForcedOff: stale window lock cleared.");
     } else {
-      forcedOffSeenWindow = false;
       logScheduleModeChange("FORCED_OFF");
       applyAcState(false, acTempState, "forced_off");
-      disableSensorsAndOccupancyIfIdle();
       return;
     }
+  }
+
+  if (justEnteredSchedule) {
+    lastMLCallMillis = 0;
   }
 
   if (!currentScheduleStatus.hasScheduleToday) {
@@ -185,12 +209,17 @@ void runMinuteControl(const struct tm& t) {
 
   if (currentScheduleStatus.inPreCool && !currentScheduleStatus.inSchedule) {
     logScheduleModeChange("PRE_COOL");
-    applyAcState(true, PRECOOL_TEMP, "pre_cool");
+    applyAcState(true, PRECOOL_TEMP, "pre_cool", justEnteredWindow || !acIrStateTrusted);
     return;
   }
 
   logScheduleModeChange("SCHEDULE");
-  unsigned long nowMs = millis();
+
+  const bool forceScheduleIr = justEnteredSchedule || !acIrStateTrusted;
+  if (justEnteredSchedule || forceScheduleIr) {
+    Serial.println("Schedule fallback ON before occupancy grace");
+    applyAcState(true, PRECOOL_TEMP, "schedule", true);
+  }
 
   unsigned long emptyReferenceMillis = scheduleWindowEnteredMillis;
   if (lastPresenceDetectedMillis > emptyReferenceMillis) {
@@ -200,18 +229,28 @@ void runMinuteControl(const struct tm& t) {
   bool scheduleNoOccupancyTooLong = (nowMs - emptyReferenceMillis) >= SCHEDULE_NO_OCC_OFF_MS;
 
   if (!presenceDetected && scheduleNoOccupancyTooLong) {
+    Serial.println("Schedule empty grace expired");
     applyAcState(false, acTempState, "empty");
     return;
   }
 
-  if (!presenceDetected) return;
-
   if (!acPowerState) {
+    Serial.println("Schedule fallback ON before occupancy grace");
     applyAcState(true, PRECOOL_TEMP, "schedule");
   }
 
+  if (!presenceDetected) return;
+
   if ((nowMs - lastMLCallMillis) >= ML_INTERVAL_MS || lastMLCallMillis == 0) {
-    if (isnan(lastTemperature) || isnan(lastHumidity)) forceReadDhtNow();
+    bool needsFreshDht = lastDhtReadMillis == 0 ||
+                         (nowMs - lastDhtReadMillis) >= DHT_INTERVAL_MS ||
+                         isnan(lastTemperature) ||
+                         isnan(lastHumidity);
+    if (needsFreshDht && !forceReadDhtNow()) {
+      Serial.println("ML: skipped (fresh DHT read failed), retry in ~1 minute");
+      lastMLCallMillis = nowMs - (ML_INTERVAL_MS - 60000UL);
+      return;
+    }
 
     Serial.println("ML: attempt from schedule controller");
     int mlTemp = acTempState;
@@ -338,8 +377,6 @@ void loop() {
   }
 
   if (firebaseInitialized && Firebase.ready()) {
-    ensureControlStream();
-
     if (streamPendingAction.hasPending) {
       StreamPendingAction act = streamPendingAction;  
       streamPendingAction     = StreamPendingAction(); 
@@ -349,6 +386,11 @@ void loop() {
         lastEspControlWriteMillis = millis(); 
         Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", act.forcedOffPersistedVal);
       }
+      if (act.writeForcedOffWindowKey) {
+        String base = "/devices/" + String(DEVICE_ID) + "/control";
+        lastEspControlWriteMillis = millis();
+        Firebase.RTDB.setString(&fbdo, base + "/forcedOffWindowKey", String(act.forcedOffWindowKey));
+      }
       if (act.writeForcedOffFalse) {
         String base = "/devices/" + String(DEVICE_ID) + "/control";
         lastEspControlWriteMillis = millis(); 
@@ -356,12 +398,19 @@ void loop() {
         Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
       }
 
-      applyAcState(act.power, act.temp, String(act.source));
+      String pendingSource = String(act.source);
+      bool forcePendingIr = pendingSource == "forced_off" || pendingSource == "override_cleared";
+      applyAcState(act.power, act.temp, pendingSource, forcePendingIr);
     }
 
     if (!startupStateLoaded) {
       if (fetchAssignedRoomFromFirebase()) {
         loadAcStateFromFirebase();
+        struct tm startupTime;
+        bool startupTimeValid = timeIsValid(startupTime);
+        if (startupTimeValid) {
+          currentScheduleStatus = evaluateScheduleStatus(startupTime);
+        }
         loadControlStateFromFirebase();
         loadEnergyProfileFromFirebase();
         loadEnergyStateFromFirebase();
@@ -370,11 +419,14 @@ void loop() {
         initializeEnergyTrackingForCurrentState();
         startupStateLoaded = true;
 
-        struct tm t;
-        if (timeIsValid(t)) {
-          runMinuteControl(t);
+        if (startupTimeValid) {
+          runMinuteControl(startupTime);
         }
       }
+    }
+
+    if (startupStateLoaded) {
+      ensureControlStream();
     }
   }
 
@@ -387,14 +439,13 @@ void loop() {
 
   tickEnergyTracking();
 
-  if (shouldPollSensors()) {
+  const bool sensorWindowOnline = shouldPollSensors();
+  if (sensorWindowOnline) {
     if (currentScheduleStatus.inSchedule && !manualOverrideActive && !presenceDetected) {
       refreshOccupancyOnly();
     } else {
       refreshSensorsAndOccupancy();
     }
-  } else if (manualOverrideActive) {
-    refreshSensorsAndOccupancy();
   } else {
     disableSensorsAndOccupancyIfIdle();
   }
