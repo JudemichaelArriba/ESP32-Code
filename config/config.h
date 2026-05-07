@@ -38,5 +38,6 @@ const int PRECOOL_TEMP = 17;
 const int DEFAULT_ESTIMATED_WATTS_ON = 950;
 const uint8_t  IR_SEND_REPEAT_COUNT    = 5;
 const uint16_t IR_SEND_REPEAT_DELAY_MS = 200;  
+const unsigned long HEARTBEAT_INTERVAL_MS = 60UL * 1000UL;
 #endif
 

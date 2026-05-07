@@ -1,4 +1,3 @@
-//ESP32-Code.ino
 #include "core/structures.h"
 #include "functions/utility_functions.h"
 #include "functions/firebase_functions.h"
@@ -6,6 +5,7 @@
 #include "functions/ac_control.h"
 #include "functions/schedule_functions.h"
 #include "functions/sensor_functions.h"
+#include "functions/heartbeat_functions.h"
 
 DHT dht(DHTPIN, DHTTYPE);
 FirebaseData fbdo;
@@ -84,10 +84,9 @@ String forcedOffWindowKey = "";
 bool idleOccupancyPublished = false;
 bool sensorWindowActive = false;
 
-// Deferred action populated by streamCallback, consumed by the main loop.
 StreamPendingAction streamPendingAction;
 
-extern unsigned long lastEspControlWriteMillis; // Imported from firebase_functions.h
+extern unsigned long lastEspControlWriteMillis;
 
 void logScheduleModeChange(const String& mode) {
   if (lastScheduleMode == mode) return;
@@ -109,7 +108,6 @@ void runMinuteControl(const struct tm& t) {
 
   currentScheduleStatus = evaluateScheduleStatus(t);
 
-  // Track window and schedule entry before any controller branch can return.
   static bool isFirstMinuteRun = true;
   bool justEnteredSchedule = false;
   bool justEnteredWindow = false;
@@ -323,15 +321,51 @@ void checkOverrideExpiry() {
   }
 }
 
+void processPendingStreamAction() {
+  if (!streamPendingAction.hasPending) return;
+
+  StreamPendingAction act = streamPendingAction;
+  streamPendingAction = StreamPendingAction();
+
+  const bool hasControlPatch = act.writeForcedOffPersisted ||
+                               act.writeForcedOffWindowKey ||
+                               act.writeForcedOffFalse;
+  if (hasControlPatch && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+    FirebaseJson patch;
+    if (act.writeForcedOffPersisted) {
+      patch.set("forcedOffPersisted", act.forcedOffPersistedVal);
+    }
+    if (act.writeForcedOffWindowKey) {
+      patch.set("forcedOffWindowKey", String(act.forcedOffWindowKey));
+    }
+    if (act.writeForcedOffFalse) {
+      patch.set("forcedOff", false);
+      patch.set("overrideActive", false);
+    }
+
+    String base = "/devices/" + String(DEVICE_ID) + "/control";
+    lastEspControlWriteMillis = millis();
+    if (!Firebase.RTDB.updateNode(&fbdo, base, &patch)) {
+      String err = fbdo.errorReason();
+      Serial.println("Control stream ack failed: " + err);
+      if (!isFirebaseTokenPendingError(err) && isFirebaseAuthOrSslError(err)) {
+        requestFirebaseReinit(err);
+      }
+    }
+  }
+
+  String pendingSource = String(act.source);
+  bool forcePendingIr = pendingSource == "forced_off" || pendingSource == "override_cleared";
+  applyAcState(act.power, act.temp, pendingSource, forcePendingIr);
+}
+
 void setup() {
   Serial.begin(115200);
 
   dht.begin();
-  
-  // Force Coolix AC library to construct a fully valid 24-bit state block 
-  // right at boot, preventing garbage data on the first turn-off command.
+
   coolixAc.begin();
-  coolixAc.on(); 
+  coolixAc.on();
   coolixAc.setFan(kCoolixFanAuto);
   coolixAc.setMode(kCoolixCool);
   coolixAc.setTemp(acTempState);
@@ -377,32 +411,6 @@ void loop() {
   }
 
   if (firebaseInitialized && Firebase.ready()) {
-    if (streamPendingAction.hasPending) {
-      StreamPendingAction act = streamPendingAction;  
-      streamPendingAction     = StreamPendingAction(); 
-
-      if (act.writeForcedOffPersisted) {
-        String base = "/devices/" + String(DEVICE_ID) + "/control";
-        lastEspControlWriteMillis = millis(); 
-        Firebase.RTDB.setBool(&fbdo, base + "/forcedOffPersisted", act.forcedOffPersistedVal);
-      }
-      if (act.writeForcedOffWindowKey) {
-        String base = "/devices/" + String(DEVICE_ID) + "/control";
-        lastEspControlWriteMillis = millis();
-        Firebase.RTDB.setString(&fbdo, base + "/forcedOffWindowKey", String(act.forcedOffWindowKey));
-      }
-      if (act.writeForcedOffFalse) {
-        String base = "/devices/" + String(DEVICE_ID) + "/control";
-        lastEspControlWriteMillis = millis(); 
-        Firebase.RTDB.setBool(&fbdo, base + "/forcedOff", false);
-        Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
-      }
-
-      String pendingSource = String(act.source);
-      bool forcePendingIr = pendingSource == "forced_off" || pendingSource == "override_cleared";
-      applyAcState(act.power, act.temp, pendingSource, forcePendingIr);
-    }
-
     if (!startupStateLoaded) {
       if (fetchAssignedRoomFromFirebase()) {
         loadAcStateFromFirebase();
@@ -427,7 +435,10 @@ void loop() {
 
     if (startupStateLoaded) {
       ensureControlStream();
+      pollControlStream();
     }
+
+    processPendingStreamAction();
   }
 
   checkMinuteTickAndRunControl();
@@ -438,6 +449,7 @@ void loop() {
   }
 
   tickEnergyTracking();
+  tickHeartbeat();  // <-- only addition to loop()
 
   const bool sensorWindowOnline = shouldPollSensors();
   if (sensorWindowOnline) {

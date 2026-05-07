@@ -58,8 +58,8 @@ struct EnergyDailyCache {
 };
 
 // ---------------------------------------------------------------------------
-// Deferred action set by streamCallback; consumed by the main loop AFTER
-// readStream() returns - prevents SSL re-entrancy crashes.
+// Deferred action set by the polled control stream and consumed by loop().
+// Firebase writes and IR sends stay outside stream parsing.
 // ---------------------------------------------------------------------------
 struct StreamPendingAction {
   bool hasPending              = false;
