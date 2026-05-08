@@ -4,6 +4,7 @@
 
 #include "../core/structures.h"
 #include "utility_functions.h"
+#include "logger_functions.h"
 
 void setControlStateToFirebase(bool active);
 bool fetchAssignedRoomFromFirebase();
@@ -40,6 +41,28 @@ static void setNetAuthState(uint8_t s) {
 static bool resolveManualOverridePower(JsonVariant data, const bool overrideActive) {
   if (!data["power"].isNull()) return data["power"].as<bool>();
   return overrideActive;
+}
+
+static void setAiAutoApplyEnabled(bool enabled, const String& reason) {
+  bool changed = aiAutoApplyEnabled != enabled;
+  aiAutoApplyEnabled = enabled;
+  if (changed) {
+    logDecisionEvent("ai_toggle_changed", "control", acPowerState, acTempState,
+                     -1, aiAutoApplyEnabled, false, reason);
+  }
+}
+
+static void loadAiAutoApplyFromControl(JsonVariant data,
+                                       const String& reason,
+                                       bool missingDefaultsFalse) {
+  if (data["aiAutoApply"].isNull()) {
+    if (missingDefaultsFalse) {
+      setAiAutoApplyEnabled(false, reason + "_missing_default_false");
+    }
+    return;
+  }
+
+  setAiAutoApplyEnabled(data["aiAutoApply"].as<bool>(), reason);
 }
 
 static bool currentScheduleWindowIsActive() {
@@ -103,6 +126,9 @@ static void queueForcedOffTrigger(const String& logPrefix) {
   queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
   streamPendingAction.writeForcedOffFalse = true;
   Serial.println(logPrefix + " forcedOff=true queued for window key: " + forcedOffWindowKey);
+  logDecisionEvent("forced_off_trigger", "forced_off", false, acTempState,
+                   -1, aiAutoApplyEnabled, true,
+                   forcedOffActive ? "window_locked" : "no_active_window");
 }
 
 static bool updateControlPatch(FirebaseJson& patch) {
@@ -161,6 +187,7 @@ void setControlStateToFirebase(bool active) {
 }
 
 void clearForcedOffPersistedInFirebase() {
+  String previousWindowKey = forcedOffWindowKey;
   clearForcedOffLocal();
   if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   FirebaseJson patch;
@@ -168,6 +195,9 @@ void clearForcedOffPersistedInFirebase() {
   patch.set("forcedOffWindowKey", "");
   updateControlPatch(patch);
   Serial.println("forcedOff persistence cleared in Firebase.");
+  logDecisionEvent("forced_off_cleared", "forced_off", acPowerState, acTempState,
+                   -1, aiAutoApplyEnabled, false,
+                   previousWindowKey.length() > 0 ? "stale_window_cleared" : "cleared");
 }
 
 bool fetchAssignedRoomFromFirebase() {
@@ -271,6 +301,8 @@ void loadControlStateFromFirebase() {
   if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
   JsonVariant control = doc.as<JsonVariant>();
 
+  loadAiAutoApplyFromControl(control, "startup_load", true);
+
   bool active = false;
   if (!control["overrideActive"].isNull()) active = control["overrideActive"].as<bool>();
   else if (!control["active"].isNull())    active = control["active"].as<bool>();
@@ -311,6 +343,9 @@ void loadControlStateFromFirebase() {
     patch.set("overrideActive", false);
     updateControlPatch(patch);
     Serial.println("Startup: forcedOff=true processed for window key: " + forcedOffWindowKey);
+    logDecisionEvent("forced_off_trigger", "forced_off", false, acTempState,
+                     -1, aiAutoApplyEnabled, true,
+                     forcedOffActive ? "startup_window_locked" : "startup_no_active_window");
     return;
   }
 
@@ -322,6 +357,8 @@ void loadControlStateFromFirebase() {
       manualOverrideActive = false;
       manualOverrideUntil = "";
       Serial.println("Startup: forcedOff persisted for current window.");
+      logDecisionEvent("forced_off_trigger", "forced_off", false, acTempState,
+                       -1, aiAutoApplyEnabled, true, "startup_persisted");
     } else {
       clearForcedOffPersistedInFirebase();
       Serial.println("Startup: stale forcedOff persistence cleared.");
@@ -338,6 +375,8 @@ static void handleControlJsonSnapshot(const String& payload) {
   DynamicJsonDocument doc(512);
   if (deserializeJson(doc, payload) != DeserializationError::Ok) return;
   JsonVariant v = doc.as<JsonVariant>();
+
+  loadAiAutoApplyFromControl(v, "stream_json", false);
 
   if (!v["forcedOff"].isNull() && v["forcedOff"].as<bool>()) {
     queueForcedOffTrigger("Stream (json):");
@@ -369,6 +408,9 @@ static void handleControlJsonSnapshot(const String& payload) {
     }
     queueAcStreamAction(manualOverridePower, manualOverrideTargetTemp, "manual");
     Serial.println("Stream (json): override ON queued.");
+    logDecisionEvent("manual_override", "manual", manualOverridePower,
+                     manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
+                     true, previousOverrideActive ? "stream_json_updated" : "stream_json_on");
 
   } else if (previousOverrideActive) {
     queueAcStreamAction(false, acTempState, "override_cleared");
@@ -376,6 +418,8 @@ static void handleControlJsonSnapshot(const String& payload) {
     setForcedOffForCurrentWindow();
     queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
     Serial.println("Stream (json): manual override off queued forcedOff key: " + forcedOffWindowKey);
+    logDecisionEvent("manual_override", "manual", false, acTempState,
+                     -1, aiAutoApplyEnabled, false, "stream_json_off");
   }
 }
 
@@ -392,6 +436,11 @@ static void handleControlStreamEvent(const String& path, const String& type) {
 
   if (type == "json") {
     handleControlJsonSnapshot(streamFbdo.jsonString());
+    return;
+  }
+
+  if (path == "/aiAutoApply" && type == "boolean") {
+    setAiAutoApplyEnabled(streamFbdo.boolData(), "stream_boolean");
     return;
   }
 
@@ -413,6 +462,9 @@ static void handleControlStreamEvent(const String& path, const String& type) {
       }
       queueAcStreamAction(manualOverridePower, manualOverrideTargetTemp, "manual");
       Serial.println("Stream: overrideActive=true queued.");
+      logDecisionEvent("manual_override", "manual", manualOverridePower,
+                       manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
+                       true, previousOverrideActive ? "stream_updated" : "stream_on");
 
     } else if (previousOverrideActive) {
       manualOverrideUntil = "";
@@ -421,6 +473,8 @@ static void handleControlStreamEvent(const String& path, const String& type) {
       setForcedOffForCurrentWindow();
       queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
       Serial.println("Stream: manual override off queued forcedOff key: " + forcedOffWindowKey);
+      logDecisionEvent("manual_override", "manual", false, acTempState,
+                       -1, aiAutoApplyEnabled, false, "stream_off");
 
     }
     return;
@@ -432,6 +486,9 @@ static void handleControlStreamEvent(const String& path, const String& type) {
     if (manualOverrideActive) {
       if (!manualOverridePower) manualOverridePower = true;
       queueAcStreamAction(manualOverridePower, manualOverrideTargetTemp, "manual");
+      logDecisionEvent("manual_override", "manual", manualOverridePower,
+                       manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
+                       true, "stream_temp_changed");
     }
     return;
   }
@@ -445,6 +502,9 @@ static void handleControlStreamEvent(const String& path, const String& type) {
     manualOverridePower = streamFbdo.boolData();
     if (manualOverrideActive) {
       queueAcStreamAction(manualOverridePower, manualOverrideTargetTemp, "manual");
+      logDecisionEvent("manual_override", "manual", manualOverridePower,
+                       manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
+                       true, "stream_power_changed");
     }
     return;
   }
@@ -584,6 +644,8 @@ void initFirebaseIfNeeded() {
     if (!Firebase.ready()) return;
     if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
     setNetAuthState(NA_READY);
+    logDecisionEvent("firebase_ready", "network", acPowerState, acTempState,
+                     -1, aiAutoApplyEnabled, false, "auth_ready");
     return;
   }
 }
