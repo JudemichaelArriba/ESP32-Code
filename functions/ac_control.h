@@ -6,6 +6,7 @@
 #include "utility_functions.h"
 #include "firebase_functions.h"
 #include "energy_functions.h"
+#include "logger_functions.h"
 
 bool applyAcState(bool targetPower, int targetTemp, const String& source);
 bool applyAcState(bool targetPower, int targetTemp, const String& source, bool forceIr);
@@ -38,6 +39,8 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source) {
 bool applyAcState(bool targetPower, int targetTemp, const String& source, bool forceIr) {
   targetTemp = normalizeACTemp((float)targetTemp);
   bool previousPower = acPowerState;
+  int previousTemp = acTempState;
+  String previousSource = acSourceState;
   bool sameState = targetPower == acPowerState && (!targetPower || targetTemp == acTempState);
   bool shouldSendIr = forceIr || !acIrStateTrusted || !sameState;
 
@@ -45,6 +48,9 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source, bool f
     if (acSourceState != source) {
       acSourceState = source;
       syncAcStateToFirebase();
+      logAcStateChange(previousPower, previousTemp, previousSource,
+                       acPowerState, acTempState, source, false,
+                       "source_changed");
     }
     return false;
   }
@@ -67,11 +73,25 @@ bool applyAcState(bool targetPower, int targetTemp, const String& source, bool f
   acSourceState = source;
   syncAcStateToFirebase();
   handleEnergyPowerTransition(previousPower, acPowerState, source);
+  logAcStateChange(previousPower, previousTemp, previousSource,
+                   acPowerState, acTempState, source, shouldSendIr,
+                   "applied");
   return true;
 }
 
 void applyControlJson(JsonVariant data) {
   if (data.isNull()) return;
+
+  if (!data["aiAutoApply"].isNull()) {
+    bool nextAiAutoApply = data["aiAutoApply"].as<bool>();
+    if (aiAutoApplyEnabled != nextAiAutoApply) {
+      aiAutoApplyEnabled = nextAiAutoApply;
+      logDecisionEvent("ai_toggle_changed", "control", acPowerState, acTempState,
+                       -1, aiAutoApplyEnabled, false, "control_json");
+    } else {
+      aiAutoApplyEnabled = nextAiAutoApply;
+    }
+  }
 
   bool hasOverride = !data["overrideActive"].isNull() || !data["active"].isNull();
   bool hasPower    = !data["power"].isNull();

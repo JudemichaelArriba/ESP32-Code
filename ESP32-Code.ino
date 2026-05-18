@@ -1,5 +1,6 @@
 #include "core/structures.h"
 #include "functions/utility_functions.h"
+#include "functions/logger_functions.h"
 #include "functions/firebase_functions.h"
 #include "functions/energy_functions.h"
 #include "functions/ac_control.h"
@@ -46,6 +47,7 @@ bool   acIrStateTrusted = false;
 bool manualOverrideActive = false;
 bool manualOverridePower  = false;
 int  manualOverrideTemp   = 24;
+bool aiAutoApplyEnabled   = false;
 
 bool streamAttached      = false;
 bool firebaseInitialized = false;
@@ -92,6 +94,8 @@ void logScheduleModeChange(const String& mode) {
   if (lastScheduleMode == mode) return;
   lastScheduleMode = mode;
   Serial.println("Mode: " + mode);
+  logDecisionEvent("mode_change", mode, acPowerState, acTempState,
+                   -1, aiAutoApplyEnabled, false, "schedule_mode_changed");
 }
 
 void runMinuteControl(const struct tm& t) {
@@ -246,19 +250,33 @@ void runMinuteControl(const struct tm& t) {
                          isnan(lastHumidity);
     if (needsFreshDht && !forceReadDhtNow()) {
       Serial.println("ML: skipped (fresh DHT read failed), retry in ~1 minute");
-      lastMLCallMillis = nowMs - (ML_INTERVAL_MS - 60000UL);
+      logMlFailure("fresh_dht_failed");
+      const unsigned long retryOffset = ML_INTERVAL_MS - 60000UL;
+      lastMLCallMillis = nowMs > retryOffset ? nowMs - retryOffset : 0;
       return;
     }
 
     Serial.println("ML: attempt from schedule controller");
     int mlTemp = acTempState;
     if (callRenderMLAndGetTarget(mlTemp)) {
-      Serial.printf("ML: apply target %d\n", mlTemp);
-      applyAcState(true, mlTemp, "ml");
+      const bool shouldAutoApply = aiAutoApplyEnabled;
+      const String mlReason = shouldAutoApply ? "auto_apply" : "suggest_only";
+      logMlSuggestion(mlTemp, shouldAutoApply, mlReason);
+
+      if (shouldAutoApply) {
+        Serial.printf("ML: auto-apply target %d\n", mlTemp);
+        applyAcState(true, mlTemp, "ml");
+        logDecisionEvent("ml_auto_applied", "ml", true, mlTemp, mlTemp,
+                         aiAutoApplyEnabled, true, "auto_apply");
+      } else {
+        Serial.printf("ML: suggestion only target %d (aiAutoApply=false)\n", mlTemp);
+      }
       lastMLCallMillis = nowMs;
     } else {
       Serial.println("ML: attempt failed, retry in ~1 minute");
-      lastMLCallMillis = nowMs - (ML_INTERVAL_MS - 60000UL);
+      logMlFailure("render_call_failed");
+      const unsigned long retryOffset = ML_INTERVAL_MS - 60000UL;
+      lastMLCallMillis = nowMs > retryOffset ? nowMs - retryOffset : 0;
     }
   }
 }
@@ -426,6 +444,8 @@ void loop() {
         syncEnergyProfileToFirebase();
         initializeEnergyTrackingForCurrentState();
         startupStateLoaded = true;
+        logDecisionEvent("boot", "startup", acPowerState, acTempState,
+                         -1, aiAutoApplyEnabled, false, "startup_state_loaded");
 
         if (startupTimeValid) {
           runMinuteControl(startupTime);

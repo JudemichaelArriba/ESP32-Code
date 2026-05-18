@@ -114,6 +114,7 @@ extern bool acIrStateTrusted;
 extern bool manualOverrideActive;
 extern bool manualOverridePower;
 extern int manualOverrideTemp;
+extern bool aiAutoApplyEnabled;
 
 extern bool streamAttached;
 extern bool firebaseInitialized;
