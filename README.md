@@ -1,108 +1,179 @@
-# ESP32-Code
+# OcuTemp ESP32 Firmware
 
-ESP32 firmware for room AC automation using:
-- DHT22 (temperature/humidity)
-- PIR + MLX90614 (occupancy detection)
-- Firebase Realtime Database (state, schedules, remote control)
-- IR Coolix transmitter (AC commands)
-- Optional Render ML endpoint (target temperature recommendation)
+Production-oriented ESP32 firmware for room air-conditioner automation. The device controls a Coolix-compatible AC unit using IR commands, Firebase Realtime Database state, room schedules, occupancy sensing, and optional ML-assisted temperature recommendations.
 
-## Project Purpose
-This project controls an air conditioner based on:
-1. Room schedule from Firebase
-2. Presence detection (PIR + IR temperature sensing)
-3. Manual override from Firebase
-4. ML-assisted temperature recommendation during active schedule windows
+## Overview
 
-## Folder Structure
+OcuTemp is designed to run as a deployed room controller. It keeps WiFi provisioning separate from AC control so the device can be moved to a new network without reflashing firmware.
+
+Core responsibilities:
+
+- Provision WiFi through WiFiManager captive portal/AP mode.
+- Connect to Firebase for room assignment, schedules, manual control, AC state, logs, heartbeat, and sensor data.
+- Evaluate schedule windows and pre-cool periods.
+- Detect occupancy with PIR and MLX90614 sensors.
+- Control the AC through IR Coolix commands.
+- Track estimated AC runtime and energy usage.
+- Send optional ML requests to a Render endpoint for target temperature suggestions.
+
+## Hardware
+
+- ESP32 development board or compatible ESP32 module
+- DHT22 temperature/humidity sensor
+- PIR motion sensor
+- Adafruit MLX90614 IR temperature sensor
+- IR LED/transmitter for Coolix AC control
+- Optional WiFi reset/provisioning button
+
+Default pins are configured in `config/config.h`:
+
+- `DHTPIN`: GPIO13
+- `PIR_PIN`: GPIO14
+- `IR_LED_PIN`: GPIO12
+- `WIFI_RESET_PIN`: GPIO27, held low for 5 seconds to clear saved WiFi credentials
+
+## Required Libraries
+
+Install these through Arduino IDE Library Manager or your existing Arduino libraries folder:
+
+- WiFiManager by tzapu, version `2.0.17`
+- Firebase ESP Client
+- ArduinoJson
+- DHT sensor library
+- Adafruit MLX90614
+- Adafruit BusIO
+- IRremoteESP8266
+
+## WiFi Provisioning
+
+The firmware no longer connects using hardcoded router credentials.
+
+On boot:
+
+1. The ESP32 tries saved WiFi credentials from flash/NVS using WiFiManager.
+2. If no saved credentials exist, or the saved network cannot connect, it opens a setup hotspot.
+3. The user connects to the hotspot and enters WiFi credentials in the WiFiManager captive portal.
+4. WiFiManager saves the credentials to ESP32 flash/NVS.
+5. The device connects to WiFi, syncs time, and continues the normal Firebase startup flow.
+
+Current setup hotspot:
+
+- SSID: `OcuTemp-Setup`
+
+Runtime reconnect behavior:
+
+- The device retries WiFi every `WIFI_RECONNECT_MS`.
+- After `WIFI_MAX_RECONNECT_FAILURES`, it restarts into the provisioning flow.
+- Saved WiFi credentials are not erased automatically.
+
+Manual WiFi reset:
+
+- Hold `WIFI_RESET_PIN` low for `WIFI_RESET_HOLD_MS`.
+- The firmware calls `wm.resetSettings()`.
+- The ESP32 restarts and opens the setup portal on the next boot.
+
+## Configuration
+
+`config/config.h` contains firmware settings that are safe to review during development:
+
+- GPIO pins
+- sensor thresholds
+- schedule/pre-cool timing
+- WiFiManager portal timing
+- reconnect retry limits
+- NTP settings
+- AC temperature limits
+- heartbeat and energy intervals
+
+Runtime WiFi router credentials are managed by WiFiManager in ESP32 flash/NVS, not by hardcoded firmware constants.
+
+## Project Structure
 
 ```text
 ESP32-Code/
 |- ESP32-Code.ino
 |- README.md
-|- .gitignore
-|- .gitattributes
 |- config/
 |  |- config.h
 |  `- secrets.h
 |- core/
 |  `- structures.h
 `- functions/
-   |- utility_functions.h
-   |- firebase_functions.h
    |- ac_control.h
+   |- energy_functions.h
+   |- firebase_functions.h
+   |- heartbeat_functions.h
+   |- logger_functions.h
    |- schedule_functions.h
-   `- sensor_functions.h
+   |- sensor_functions.h
+   |- utility_functions.h
+   `- wifi_functions.h
 ```
 
-## What Each File Does
+## Main Modules
 
-### Root
-- `ESP32-Code.ino`: Main sketch. Initializes hardware/services and runs the control loop.
-- `README.md`: Project documentation.
-- `.gitignore`: Ignores `config/secrets.h` so credentials are not committed.
-- `.gitattributes`: Git text normalization (`* text=auto`).
-
-### `config/`
-- `config.h`: Hardware pins, timing intervals, AC limits, pre-cool timing, occupancy thresholds, NTP settings.
-- `secrets.h`: Sensitive values (Wi-Fi, Firebase API/auth, Render endpoint, `DEVICE_ID`).
-
-### `core/`
+- `ESP32-Code.ino`: Main sketch, global state, hardware setup, boot flow, and main loop.
+- `wifi_functions.h`: WiFiManager provisioning, captive portal setup, WiFi reset button, and reconnect failure escalation.
+- `firebase_functions.h`: Firebase initialization, room fetch, AC/control state sync, and control stream handling.
+- `schedule_functions.h`: Pre-cool and active schedule evaluation.
+- `ac_control.h`: Coolix IR command generation and AC state application.
+- `sensor_functions.h`: DHT22, PIR, MLX90614, occupancy publishing, and ML endpoint calls.
+- `energy_functions.h`: Runtime session tracking and estimated energy usage.
+- `heartbeat_functions.h`: Device status heartbeat updates.
+- `logger_functions.h`: Decision, ML, and AC state logs.
+- `utility_functions.h`: Time helpers, schedule parsing, PIR ISR, and AC temperature normalization.
 - `structures.h`: Shared includes, structs, and global extern declarations.
-  - Defines:
-    - `ScheduleSlot`: day + start/end minutes
-    - `RoomConfig`: assigned room + schedule list
-    - `ScheduleStatus`: schedule flags (`hasScheduleToday`, `inPreCool`, `inSchedule`)
 
-### `functions/`
-- `utility_functions.h`:
-  - PIR ISR (`onPirMotion`)
-  - AC temp normalization
-  - Time/date helpers
-  - Schedule parsing and day/range matching
+## Runtime Flow
 
-- `firebase_functions.h`:
-  - Wi-Fi reconnect + Firebase init
-  - Fetch assigned room from `/rooms`
-  - Load/sync AC state to `/devices/{DEVICE_ID}/acState`
-  - Load and stream manual control from `/devices/{DEVICE_ID}/control`
+1. Initialize serial, sensors, PIR interrupt, and IR transmitter.
+2. Configure device identity and backend service access.
+3. Run WiFiManager provisioning through `setupWiFiProvisioning()`.
+4. Sync NTP time.
+5. In the main loop:
+   - service the WiFi reset button
+   - keep WiFi and Firebase connected
+   - load startup room/control/energy state once Firebase is ready
+   - attach and poll the Firebase control stream
+   - run minute-based schedule control
+   - expire manual overrides when needed
+   - track energy runtime
+   - send heartbeat
+   - poll sensors only during manual, pre-cool, or schedule windows
 
-- `ac_control.h`:
-  - Sends IR commands via Coolix protocol
-  - Applies power/temp state with source tracking (`schedule`, `manual`, `ml`, etc.)
-  - Parses control JSON and enforces manual override behavior
+## Control Behavior
 
-- `schedule_functions.h`:
-  - Evaluates if current time is pre-cool or active schedule
-  - Decides whether sensors should be polled
+Schedule logic follows this priority:
 
-- `sensor_functions.h`:
-  - Reads DHT22 and MLX90614 on intervals
-  - Combines PIR + MLX signals into presence state
-  - Pushes occupancy/temp/humidity to Firebase
-  - Calls Render ML endpoint and extracts `recommended_ac`
+1. No assigned room: AC off
+2. Forced off: AC off for the active schedule window
+3. Manual override: follow requested power and target temperature
+4. No schedule today: AC off
+5. Outside schedule window: AC off
+6. Pre-cool window: AC on at `PRECOOL_TEMP`
+7. Active schedule: AC on, occupancy-aware, with optional ML target suggestions
+8. Empty room past grace period: AC off
 
-## Runtime Control Flow
-1. Boot: initialize serial, sensors, IR, Wi-Fi, NTP.
-2. Loop:
-   - Keep Wi-Fi/Firebase connected and stream attached.
-   - Load startup state once (room assignment, AC/control state).
-   - Poll sensors only during manual/pre-cool/schedule windows.
-   - On each minute tick, run schedule control logic:
-     - No room or no schedule today => AC off
-     - Outside window => AC off
-     - Manual override => follow manual power/temp
-     - Pre-cool => AC on at fixed pre-cool temp
-     - In schedule with occupancy => AC on and periodically adjust using ML
-     - Empty too long => AC off
+## Firebase Paths
 
-## Firebase Paths Used
+The firmware reads or writes these main paths:
+
 - `/rooms`
 - `/devices/{DEVICE_ID}/control`
 - `/devices/{DEVICE_ID}/acState`
+- `/devices/{DEVICE_ID}/status`
 - `/devices/{DEVICE_ID}/occupancy`
 - `/devices/{DEVICE_ID}/temperature`
 - `/devices/{DEVICE_ID}/humidity`
+- `/devices/{DEVICE_ID}/energyProfile`
+- `/devices/{DEVICE_ID}/energyState`
+- `/devices/{DEVICE_ID}/energyDaily/{date}`
+- `/devices/{DEVICE_ID}/mlSuggestion`
+- `/decisionLogs`
 
-## Notes
-- All function modules are header-only; logic is compiled through includes from the main `.ino`.
+## Production Notes
+
+- The setup hotspot should only be used during provisioning or recovery.
+- Do not call `wm.resetSettings()` automatically during normal WiFi failure; the firmware only clears credentials through the reset button path.
+- Existing schedule, manual override, Firebase, sensor, and AC control flows are gated by WiFi/Firebase readiness checks.
+- All function modules are header-only and are compiled through includes from `ESP32-Code.ino`.
