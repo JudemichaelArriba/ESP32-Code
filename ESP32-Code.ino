@@ -1,4 +1,5 @@
 #include "core/structures.h"
+#include "functions/wifi_functions.h"
 #include "functions/utility_functions.h"
 #include "functions/logger_functions.h"
 #include "functions/firebase_functions.h"
@@ -402,8 +403,7 @@ void setup() {
   auth.user.email     = ESP_EMAIL;
   auth.user.password  = ESP_PASSWORD;
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  setupWiFiProvisioning();
 
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
 
@@ -419,6 +419,7 @@ void setup() {
 }
 
 void loop() {
+  serviceWiFiProvisioning();
   reconnectWiFiNonBlocking();
   initFirebaseIfNeeded();
 

@@ -3,6 +3,7 @@
 #define FIREBASE_FUNCTIONS_H
 
 #include "../core/structures.h"
+#include "wifi_functions.h"
 #include "utility_functions.h"
 #include "logger_functions.h"
 
@@ -565,6 +566,8 @@ void reconnectWiFiNonBlocking() {
   wl_status_t status = WiFi.status();
 
   if (status == WL_CONNECTED) {
+    resetWiFiReconnectFailures();
+
     if (!wifiLinkUp) {
       wifiLinkUp              = true;
       lastWiFiConnectedMillis = millis();
@@ -607,6 +610,7 @@ void reconnectWiFiNonBlocking() {
   startupStateLoaded       = false;
   Serial.println("WiFi disconnected, reconnecting...");
   WiFi.reconnect();
+  noteWiFiReconnectFailure();
 }
 
 void initFirebaseIfNeeded() {
