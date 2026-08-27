@@ -21,6 +21,8 @@ bool isFirebaseAuthOrSslError(const String& err);
 bool isFirebaseTokenPendingError(const String& err);
 bool isFirebaseRevokedError(const String& err);
 void requestFirebaseReinit(const String& reason);
+void noteFirebaseDataSuccess();
+void noteFirebaseDataFailure(const String& operation, const String& error, int httpCode = 0);
 void clearForcedOffPersistedInFirebase();
 ScheduleStatus evaluateScheduleStatus(const struct tm& t);
 
@@ -32,6 +34,15 @@ static const uint8_t NA_READY       = 4;
 
 // Global timer to debounce our own HTTP writes from the Realtime Stream
 unsigned long lastEspControlWriteMillis = 0;
+
+static uint8_t firebaseDataFailureCount = 0;
+static uint8_t firebaseStreamFailureCount = 0;
+static unsigned long firebaseRetryNotBeforeMillis = 0;
+static unsigned long firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MIN_MS;
+
+static bool deadlineReached(unsigned long now, unsigned long deadline) {
+  return deadline == 0 || (long)(now - deadline) >= 0;
+}
 
 static void setNetAuthState(uint8_t s) {
   if (netAuthState == s) return;
@@ -137,14 +148,13 @@ static bool updateControlPatch(FirebaseJson& patch) {
   lastEspControlWriteMillis = millis();
 
   if (Firebase.RTDB.updateNode(&fbdo, base, &patch)) {
+    noteFirebaseDataSuccess();
     return true;
   }
 
   String err = fbdo.errorReason();
   Serial.println("Control patch failed: " + err);
-  if (!isFirebaseTokenPendingError(err) && isFirebaseAuthOrSslError(err)) {
-    requestFirebaseReinit(err);
-  }
+  noteFirebaseDataFailure("control_patch", err, fbdo.httpCode());
   return false;
 }
 
@@ -159,26 +169,89 @@ bool isFirebaseRevokedError(const String& err) {
 
 // Catch a broader range of network/SSL failures so the client actually resets
 bool isFirebaseAuthOrSslError(const String& err) {
-  return isFirebaseRevokedError(err) ||
-         err.indexOf("ssl") >= 0 ||
-         err.indexOf("SSL") >= 0 ||
-         err.indexOf("not connected") >= 0 ||
-         err.indexOf("connection") >= 0 ||
-         err.indexOf("TCP") >= 0 ||
-         err.indexOf("closed") >= 0;
+  String normalized = err;
+  normalized.toLowerCase();
+  return isFirebaseRevokedError(normalized) ||
+         normalized.indexOf("ssl") >= 0 ||
+         normalized.indexOf("handshake") >= 0 ||
+         normalized.indexOf("not connected") >= 0 ||
+         normalized.indexOf("connection") >= 0 ||
+         normalized.indexOf("tcp") >= 0 ||
+         normalized.indexOf("closed") >= 0 ||
+         normalized.indexOf("timeout") >= 0 ||
+         normalized.indexOf("timed out") >= 0 ||
+         normalized.indexOf("unauthorized") >= 0 ||
+         normalized.indexOf("permission denied") >= 0;
+}
+
+static bool isFirebaseCredentialError(const String& err, int httpCode) {
+  String normalized = err;
+  normalized.toLowerCase();
+  return httpCode == 401 || httpCode == 403 ||
+         isFirebaseRevokedError(normalized) ||
+         normalized.indexOf("unauthorized") >= 0 ||
+         normalized.indexOf("permission denied") >= 0;
 }
 
 void requestFirebaseReinit(const String& reason) {
   unsigned long now = millis();
-  if ((now - lastStreamRetryMillis) < 10000) return;
+  if (!firebaseInitialized && netAuthState == NA_WAIT_STABLE &&
+      !deadlineReached(now, firebaseRetryNotBeforeMillis)) return;
 
-  lastStreamRetryMillis = now;
+  firebaseRecoveryCount++;
   Serial.println("Firebase reinit requested: " + reason);
   streamAttached      = false;
   firebaseInitialized = false;
   startupStateLoaded  = false;
   Firebase.RTDB.endStream(&streamFbdo);
+  lastStreamRetryMillis = now;
+  lastWiFiConnectedMillis = now;
+  firebaseRetryNotBeforeMillis = now + firebaseReinitBackoffMillis;
+  if (firebaseReinitBackoffMillis < FIREBASE_REINIT_BACKOFF_MAX_MS) {
+    firebaseReinitBackoffMillis *= 2;
+    if (firebaseReinitBackoffMillis > FIREBASE_REINIT_BACKOFF_MAX_MS) {
+      firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MAX_MS;
+    }
+  }
   setNetAuthState(NA_WAIT_STABLE);
+}
+
+void noteFirebaseDataSuccess() {
+  firebaseDataFailureCount = 0;
+}
+
+void noteFirebaseDataFailure(const String& operation, const String& error, int httpCode) {
+  if (isFirebaseTokenPendingError(error)) return;
+  if (firebaseDataFailureCount < 255) firebaseDataFailureCount++;
+
+  Serial.printf("Firebase %s failure %u/%u (HTTP %d): %s\n",
+                operation.c_str(), firebaseDataFailureCount,
+                FIREBASE_FAILURES_BEFORE_REINIT, httpCode, error.c_str());
+
+  const bool fatal = isFirebaseCredentialError(error, httpCode);
+  if (fatal || firebaseDataFailureCount >= FIREBASE_FAILURES_BEFORE_REINIT) {
+    requestFirebaseReinit(operation + ": " + error);
+  }
+}
+
+static void noteFirebaseStreamFailure(const String& operation,
+                                      const String& error,
+                                      int httpCode) {
+  if (isFirebaseTokenPendingError(error)) return;
+
+  streamAttached = false;
+  Firebase.RTDB.endStream(&streamFbdo);
+  lastStreamRetryMillis = millis();
+  if (firebaseStreamFailureCount < 255) firebaseStreamFailureCount++;
+
+  Serial.printf("Firebase %s failure %u/%u (HTTP %d): %s\n",
+                operation.c_str(), firebaseStreamFailureCount,
+                FIREBASE_FAILURES_BEFORE_REINIT, httpCode, error.c_str());
+
+  if (isFirebaseCredentialError(error, httpCode) ||
+      firebaseStreamFailureCount >= FIREBASE_FAILURES_BEFORE_REINIT) {
+    requestFirebaseReinit(operation + ": " + error);
+  }
 }
 
 void setControlStateToFirebase(bool active) {
@@ -215,10 +288,10 @@ bool fetchAssignedRoomFromFirebase() {
   if (!Firebase.RTDB.getJSON(&fbdo, "/rooms")) {
     String err = fbdo.errorReason();
     Serial.println("Failed to read /rooms: " + err);
-    if (isFirebaseTokenPendingError(err)) return false;
-    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
+    noteFirebaseDataFailure("rooms_read", err, fbdo.httpCode());
     return false;
   }
+  noteFirebaseDataSuccess();
 
   DynamicJsonDocument doc(16384);
   if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) {
@@ -517,16 +590,14 @@ void ensureControlStream() {
   if (streamAttached) return;
 
   unsigned long now = millis();
-  if ((now - lastStreamRetryMillis)  < 5000)                  return;
+  if ((now - lastStreamRetryMillis) < FIREBASE_STREAM_RETRY_MS) return;
   if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
 
   String streamPath = "/devices/" + String(DEVICE_ID) + "/control";
   if (!Firebase.RTDB.beginStream(&streamFbdo, streamPath)) {
     String err = streamFbdo.errorReason();
     Serial.println("Control stream begin failed: " + err);
-    lastStreamRetryMillis = now;
-    if (isFirebaseTokenPendingError(err)) return;
-    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
+    noteFirebaseStreamFailure("stream_begin", err, streamFbdo.httpCode());
     return;
   }
 
@@ -543,17 +614,19 @@ void pollControlStream() {
       Serial.println("Control stream read failed: " + err);
     }
     if (isFirebaseTokenPendingError(err)) return;
-    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
+
+    noteFirebaseStreamFailure("stream_read", err, streamFbdo.httpCode());
     return;
   }
+
+  firebaseStreamFailureCount = 0;
 
   if (streamFbdo.streamTimeout()) {
     Serial.println("Firebase stream timeout, auto-resuming...");
     if (!streamFbdo.httpConnected()) {
       String err = streamFbdo.errorReason();
-      if (!isFirebaseTokenPendingError(err) && isFirebaseAuthOrSslError(err)) {
-        requestFirebaseReinit(err);
-      }
+      noteFirebaseStreamFailure("stream_timeout", err, streamFbdo.httpCode());
+      return;
     }
   }
 
@@ -622,6 +695,9 @@ void initFirebaseIfNeeded() {
 
   unsigned long now = millis();
 
+  if (!deadlineReached(now, firebaseRetryNotBeforeMillis)) return;
+  firebaseRetryNotBeforeMillis = 0;
+
   if (netAuthState == NA_WAIT_STABLE) {
     if ((now - lastWiFiConnectedMillis) < WIFI_STABLE_BEFORE_FB_MS) return;
     setNetAuthState(NA_AUTH_INIT);
@@ -631,7 +707,12 @@ void initFirebaseIfNeeded() {
     // Bump BSSL buffer slightly to give the SSL engine more breathing room
     fbdo.setBSSLBufferSize(8192, 2048);
     streamFbdo.setBSSLBufferSize(8192, 2048);
-    config.timeout.socketConnection = 10000;
+    config.timeout.socketConnection = FIREBASE_SOCKET_TIMEOUT_MS;
+    config.timeout.sslHandshake = FIREBASE_SSL_HANDSHAKE_TIMEOUT_MS;
+    config.timeout.serverResponse = FIREBASE_SERVER_RESPONSE_TIMEOUT_MS;
+    config.timeout.rtdbKeepAlive = FIREBASE_STREAM_KEEPALIVE_MS;
+    config.timeout.rtdbStreamReconnect = FIREBASE_STREAM_RECONNECT_MS;
+    config.timeout.rtdbStreamError = FIREBASE_STREAM_ERROR_MS;
 
     Firebase.begin(&config, &auth);
     Firebase.reconnectNetwork(true);
@@ -645,9 +726,17 @@ void initFirebaseIfNeeded() {
   }
 
   if (netAuthState == NA_AUTH_WAIT) {
-    if (!Firebase.ready()) return;
+    if (!Firebase.ready()) {
+      if ((now - netAuthStateSince) >= FIREBASE_AUTH_TIMEOUT_MS) {
+        requestFirebaseReinit("authentication timeout");
+      }
+      return;
+    }
     if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
     setNetAuthState(NA_READY);
+    firebaseDataFailureCount = 0;
+    firebaseStreamFailureCount = 0;
+    firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MIN_MS;
     logDecisionEvent("firebase_ready", "network", acPowerState, acTempState,
                      -1, aiAutoApplyEnabled, false, "auth_ready");
     return;

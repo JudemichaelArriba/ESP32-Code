@@ -68,6 +68,14 @@ static void updateMlxPresenceFilter(const bool mlxHumanLikeNow) {
 }
 
 static void refreshMlxPresenceIfDue(const unsigned long now) {
+  if (!mlxAvailable) {
+    if ((now - lastMlxInitAttemptMillis) < MLX_REINIT_INTERVAL_MS) return;
+    lastMlxInitAttemptMillis = now;
+    mlxAvailable = mlx.begin();
+    Serial.println(mlxAvailable ? "MLX90614: recovered." : "MLX90614: retry failed.");
+    if (!mlxAvailable) return;
+  }
+
   if ((now - lastMlxReadMillis) >= MLX_INTERVAL_MS || lastMlxReadMillis == 0) {
     lastMlxReadMillis = now;
     mlxObjectTemp = mlx.readObjectTempC();

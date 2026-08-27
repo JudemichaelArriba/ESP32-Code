@@ -171,9 +171,15 @@ The firmware reads or writes these main paths:
 - `/devices/{DEVICE_ID}/mlSuggestion`
 - `/decisionLogs`
 
+The device status heartbeat includes `lastSeen`, IP address, firmware version,
+boot/reset information, current and minimum free heap, Firebase recovery count,
+and MLX90614 availability.
+
 ## Production Notes
 
 - The setup hotspot should only be used during provisioning or recovery.
 - Do not call `wm.resetSettings()` automatically during normal WiFi failure; the firmware only clears credentials through the reset button path.
 - Existing schedule, manual override, Firebase, sensor, and AC control flows are gated by WiFi/Firebase readiness checks.
+- Firebase stream failures are retried before escalating to a full Firebase reinitialization with bounded backoff.
+- A loop watchdog recovers from a blocked network operation, and MLX90614 initialization failure no longer blocks network startup.
 - All function modules are header-only and are compiled through includes from `ESP32-Code.ino`.

@@ -149,6 +149,10 @@ extern bool forcedOffActive;
 extern String forcedOffWindowKey;
 extern bool idleOccupancyPublished;
 extern bool sensorWindowActive;
+extern bool mlxAvailable;
+extern unsigned long lastMlxInitAttemptMillis;
+extern uint32_t bootCount;
+extern uint32_t firebaseRecoveryCount;
 
 // Deferred stream action (defined in main.ino)
 extern StreamPendingAction streamPendingAction;

@@ -8,6 +8,9 @@
 #include "functions/schedule_functions.h"
 #include "functions/sensor_functions.h"
 #include "functions/heartbeat_functions.h"
+#include <esp_idf_version.h>
+#include <esp_system.h>
+#include <esp_task_wdt.h>
 
 DHT dht(DHTPIN, DHTTYPE);
 FirebaseData fbdo;
@@ -86,10 +89,40 @@ bool forcedOffActive = false;
 String forcedOffWindowKey = "";
 bool idleOccupancyPublished = false;
 bool sensorWindowActive = false;
+bool mlxAvailable = false;
+unsigned long lastMlxInitAttemptMillis = 0;
+RTC_DATA_ATTR uint32_t bootCount = 0;
+uint32_t firebaseRecoveryCount = 0;
 
 StreamPendingAction streamPendingAction;
 
 extern unsigned long lastEspControlWriteMillis;
+
+static void initializeLoopWatchdog() {
+#if ESP_IDF_VERSION_MAJOR >= 5
+  esp_task_wdt_config_t watchdogConfig = {};
+  watchdogConfig.timeout_ms = LOOP_WATCHDOG_TIMEOUT_MS;
+  // Monitor loopTask only. Firebase streaming can legitimately keep CPU1 busy,
+  // so subscribing its idle task would cause false watchdog resets.
+  watchdogConfig.idle_core_mask = 0;
+  watchdogConfig.trigger_panic = true;
+  esp_err_t initResult = esp_task_wdt_init(&watchdogConfig);
+  if (initResult == ESP_ERR_INVALID_STATE) {
+    initResult = esp_task_wdt_reconfigure(&watchdogConfig);
+  }
+#else
+  esp_err_t initResult = esp_task_wdt_init(LOOP_WATCHDOG_TIMEOUT_MS / 1000U, true);
+#endif
+  if (initResult != ESP_OK && initResult != ESP_ERR_INVALID_STATE) {
+    Serial.printf("Watchdog: init failed (%d)\n", (int)initResult);
+    return;
+  }
+
+  esp_err_t addResult = esp_task_wdt_add(nullptr);
+  if (addResult != ESP_OK && addResult != ESP_ERR_INVALID_STATE) {
+    Serial.printf("Watchdog: task registration failed (%d)\n", (int)addResult);
+  }
+}
 
 void logScheduleModeChange(const String& mode) {
   if (lastScheduleMode == mode) return;
@@ -380,6 +413,7 @@ void processPendingStreamAction() {
 
 void setup() {
   Serial.begin(115200);
+  bootCount++;
 
   dht.begin();
 
@@ -393,9 +427,10 @@ void setup() {
   pinMode(PIR_PIN, PIR_ACTIVE_HIGH ? INPUT_PULLDOWN : INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIR_PIN), onPirMotion, PIR_ACTIVE_HIGH ? RISING : FALLING);
 
-  if (!mlx.begin()) {
-    Serial.println("Could not find MLX90614 sensor. Check wiring!");
-    while (1) { delay(1000); }
+  lastMlxInitAttemptMillis = millis();
+  mlxAvailable = mlx.begin();
+  if (!mlxAvailable) {
+    Serial.println("MLX90614 unavailable at boot; continuing and retrying in loop.");
   }
 
   config.database_url = String("https://") + FIREBASE_HOST;
@@ -416,6 +451,7 @@ void setup() {
     retry++;
   }
   Serial.println("\nTime synced.");
+  initializeLoopWatchdog();
 }
 
 void loop() {
@@ -482,4 +518,6 @@ void loop() {
   } else {
     disableSensorsAndOccupancyIfIdle();
   }
+
+  esp_task_wdt_reset();
 }
