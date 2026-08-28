@@ -34,7 +34,10 @@ const unsigned long WIFI_PORTAL_TIMEOUT_SEC = 300;
 const unsigned long WIFI_RECONNECT_MS = 5000;
 const uint8_t WIFI_MAX_RECONNECT_FAILURES = 36;
 const unsigned long WIFI_RESET_HOLD_MS = 5UL * 1000UL;
-const unsigned long NTP_RESYNC_MS = 60000;
+const unsigned long NTP_VALID_CHECK_MS = 30UL * 1000UL;
+const unsigned long NTP_RETRY_MS = 30UL * 1000UL;
+const unsigned long NTP_RECONFIG_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
+const uint8_t NTP_FAILURES_BEFORE_WIFI_RECOVERY = 5;
 const unsigned long WIFI_STABLE_BEFORE_FB_MS = 5000;
 const unsigned long FIREBASE_AUTH_SETTLE_MS = 20000;
 const unsigned long FIREBASE_AUTH_TIMEOUT_MS = 90UL * 1000UL;
@@ -42,6 +45,11 @@ const unsigned long FIREBASE_STREAM_RETRY_MS = 5000;
 const unsigned long FIREBASE_REINIT_BACKOFF_MIN_MS = 5000;
 const unsigned long FIREBASE_REINIT_BACKOFF_MAX_MS = 60UL * 1000UL;
 const uint8_t FIREBASE_FAILURES_BEFORE_REINIT = 3;
+const unsigned long FIREBASE_READY_LOSS_TIMEOUT_MS = 75UL * 1000UL;
+const uint8_t FIREBASE_RECOVERIES_BEFORE_WIFI_RECOVERY = 3;
+const unsigned long NETWORK_RECOVERY_COOLDOWN_MS = 2UL * 60UL * 1000UL;
+const unsigned long NETWORK_OUTAGE_RESTART_MS = 10UL * 60UL * 1000UL;
+const unsigned long RECOVERY_JITTER_MAX_MS = 3000UL;
 const uint16_t FIREBASE_SOCKET_TIMEOUT_MS = 10000;
 const uint16_t FIREBASE_SSL_HANDSHAKE_TIMEOUT_MS = 15000;
 const uint16_t FIREBASE_SERVER_RESPONSE_TIMEOUT_MS = 10000;
@@ -66,5 +74,5 @@ const unsigned long MLX_REINIT_INTERVAL_MS = 30UL * 1000UL;
 // Firebase's synchronous TLS handshake can legitimately take about 60 seconds.
 // Keep the watchdog above that ceiling while still recovering a truly stuck loop.
 const uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 120UL * 1000UL;
-const char* FIRMWARE_VERSION = "2026.08.28-recovery2";
+const char* FIRMWARE_VERSION = "2026.08.29-recovery3";
 #endif

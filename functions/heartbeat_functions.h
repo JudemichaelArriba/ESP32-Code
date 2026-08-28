@@ -35,6 +35,7 @@ void tickHeartbeat() {
 
   FirebaseJson json;
   json.set("lastSeen", nowIsoString());
+  json.set("lastSeenServer/.sv", "timestamp");
   json.set("ip", WiFi.localIP().toString());
   json.set("firmwareVersion", FIRMWARE_VERSION);
   json.set("bootCount", (int)bootCount);
@@ -42,7 +43,19 @@ void tickHeartbeat() {
   json.set("freeHeap", (int)ESP.getFreeHeap());
   json.set("minimumFreeHeap", (int)ESP.getMinFreeHeap());
   json.set("firebaseRecoveryCount", (int)firebaseRecoveryCount);
+  json.set("firebaseRecoveryStreak", (int)firebaseSessionRecoveryStreak);
+  json.set("heartbeatFailures", (int)consecutiveHeartbeatFailures);
+  json.set("lastHeartbeatSuccessUptimeMs", (int)lastHeartbeatSuccessMillis);
+  json.set("ntpTimeValid", ntpTimeValid);
+  json.set("ntpFailures", (int)consecutiveNtpFailures);
+  json.set("lastNtpValidUptimeMs", (int)lastNtpValidMillis);
+  json.set("lastFirebaseReadyUptimeMs", (int)lastFirebaseReadyMillis);
+  json.set("tokenStatus", lastFirebaseTokenStatus);
+  if (lastFirebaseTokenErrorCode != 0) {
+    json.set("tokenErrorCode", lastFirebaseTokenErrorCode);
+  }
   json.set("mlxAvailable", mlxAvailable);
+  appendPersistentDiagnosticsToJson(json);
   if (previousResetBreadcrumbAvailable) {
     json.set("previousResetOperation", String(previousResetOperation));
     json.set("previousResetUptimeMs", (int)previousResetUptimeMs);
@@ -58,12 +71,22 @@ void tickHeartbeat() {
     Serial.println("Heartbeat: OK");
     lastHeartbeatMillis = now;
     lastHeartbeatAttemptMillis = 0;
+    noteFirebaseHeartbeatSuccess();
     noteFirebaseDataSuccess();
+    clearUploadedPersistentDiagnostics();
     previousResetBreadcrumbAvailable = false;
   } else {
     String err = fbdo.errorReason();
+    const int httpCode = fbdo.httpCode();
     Serial.println("Heartbeat: write failed (" + err + ")");
-    noteFirebaseDataFailure("heartbeat", err, fbdo.httpCode());
+    if (consecutiveHeartbeatFailures < 255) consecutiveHeartbeatFailures++;
+    if (consecutiveHeartbeatFailures == FIREBASE_FAILURES_BEFORE_REINIT) {
+      recordPersistentDiagnostic("heartbeat_failed", err);
+    }
+    noteFirebaseDataFailure("heartbeat", err, httpCode);
+    if (consecutiveHeartbeatFailures >= FIREBASE_FAILURES_BEFORE_REINIT) {
+      requestFirebaseReinit("consecutive heartbeat failures: " + err);
+    }
   }
 }
 

@@ -64,6 +64,10 @@ unsigned long lastMlxReadMillis            = 0;
 unsigned long lastMLCallMillis             = 0;
 unsigned long lastWiFiReconnectAttempt     = 0;
 unsigned long lastNtpSyncMillis            = 0;
+unsigned long lastNtpValidMillis           = 0;
+unsigned long lastNtpCheckMillis           = 0;
+bool ntpTimeValid                          = false;
+uint8_t consecutiveNtpFailures             = 0;
 unsigned long lastWiFiConnectedMillis      = 0;
 unsigned long lastFirebaseInitMillis       = 0;
 unsigned long lastStreamRetryMillis        = 0;
@@ -94,6 +98,15 @@ unsigned long lastMlxInitAttemptMillis = 0;
 RTC_DATA_ATTR uint32_t bootCount = 0;
 RTC_DATA_ATTR RuntimeBreadcrumb runtimeBreadcrumb;
 uint32_t firebaseRecoveryCount = 0;
+unsigned long lastFirebaseReadyMillis = 0;
+unsigned long firebaseUnavailableSinceMillis = 0;
+unsigned long networkOutageSinceMillis = 0;
+uint8_t firebaseSessionRecoveryStreak = 0;
+unsigned long lastHeartbeatSuccessMillis = 0;
+uint8_t consecutiveHeartbeatFailures = 0;
+String lastFirebaseTokenStatus = "uninitialized";
+int lastFirebaseTokenErrorCode = 0;
+String lastFirebaseTokenError = "";
 uint8_t startupStateFailureCount = 0;
 bool previousResetBreadcrumbAvailable = false;
 uint32_t previousResetUptimeMs = 0;
@@ -434,6 +447,7 @@ void setup() {
   config.api_key      = FIREBASE_API_KEY;
   auth.user.email     = ESP_EMAIL;
   auth.user.password  = ESP_PASSWORD;
+  config.token_status_callback = firebaseTokenStatusCallback;
 
   setupWiFiProvisioning();
 
@@ -448,10 +462,15 @@ void setup() {
     retry++;
   }
   if (timeIsValid(timeinfo)) {
+    ntpTimeValid = true;
+    lastNtpValidMillis = millis();
+    consecutiveNtpFailures = 0;
     Serial.println("\nTime synced.");
   } else {
+    ntpTimeValid = false;
     Serial.println("\nTime sync unavailable; Firebase will wait and retry.");
   }
+  lastNtpSyncMillis = millis();
 
   if (restoredManualOverridePendingApply && manualOverrideActive) {
     checkOverrideExpiry();
@@ -467,13 +486,9 @@ void setup() {
 void loop() {
   serviceWiFiProvisioning();
   reconnectWiFiNonBlocking();
+  serviceNetworkTime();
+  serviceNetworkRecovery();
   initFirebaseIfNeeded();
-
-  if (WiFi.status() == WL_CONNECTED &&
-      (millis() - lastNtpSyncMillis >= NTP_RESYNC_MS || lastNtpSyncMillis == 0)) {
-    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
-    lastNtpSyncMillis = millis();
-  }
 
   if (firebaseInitialized && Firebase.ready()) {
     if (!startupStateLoaded) {
@@ -523,7 +538,7 @@ void loop() {
   }
 
   struct tm _tCheck;
-  if (timeIsValid(_tCheck)) {
+  if (ntpTimeValid && timeIsValid(_tCheck)) {
     checkOverrideExpiry();
   }
 

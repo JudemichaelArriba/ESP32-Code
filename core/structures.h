@@ -80,6 +80,23 @@ struct RuntimeBreadcrumb {
   char operation[40];
 };
 
+const uint8_t DIAGNOSTIC_HISTORY_CAPACITY = 6;
+
+struct DiagnosticRecord {
+  uint32_t bootNumber;
+  uint32_t uptimeMs;
+  char event[28];
+  char detail[68];
+};
+
+struct DiagnosticHistory {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t count;
+  uint8_t nextIndex;
+  DiagnosticRecord records[DIAGNOSTIC_HISTORY_CAPACITY];
+};
+
 // Global objects
 extern DHT dht;
 extern FirebaseData fbdo;
@@ -133,6 +150,10 @@ extern unsigned long lastMlxReadMillis;
 extern unsigned long lastMLCallMillis;
 extern unsigned long lastWiFiReconnectAttempt;
 extern unsigned long lastNtpSyncMillis;
+extern unsigned long lastNtpValidMillis;
+extern unsigned long lastNtpCheckMillis;
+extern bool ntpTimeValid;
+extern uint8_t consecutiveNtpFailures;
 extern unsigned long lastWiFiConnectedMillis;
 extern unsigned long lastFirebaseInitMillis;
 extern unsigned long lastStreamRetryMillis;
@@ -159,6 +180,15 @@ extern bool mlxAvailable;
 extern unsigned long lastMlxInitAttemptMillis;
 extern uint32_t bootCount;
 extern uint32_t firebaseRecoveryCount;
+extern unsigned long lastFirebaseReadyMillis;
+extern unsigned long firebaseUnavailableSinceMillis;
+extern unsigned long networkOutageSinceMillis;
+extern uint8_t firebaseSessionRecoveryStreak;
+extern unsigned long lastHeartbeatSuccessMillis;
+extern uint8_t consecutiveHeartbeatFailures;
+extern String lastFirebaseTokenStatus;
+extern int lastFirebaseTokenErrorCode;
+extern String lastFirebaseTokenError;
 extern RuntimeBreadcrumb runtimeBreadcrumb;
 extern bool previousResetBreadcrumbAvailable;
 extern uint32_t previousResetUptimeMs;

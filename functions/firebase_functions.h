@@ -17,6 +17,8 @@ bool loadControlStateFromFirebase();
 void ensureControlStream();
 void pollControlStream();
 void reconnectWiFiNonBlocking();
+void serviceNetworkTime();
+void serviceNetworkRecovery();
 void initFirebaseIfNeeded();
 bool isFirebaseAuthOrSslError(const String& err);
 bool isFirebaseTokenPendingError(const String& err);
@@ -24,6 +26,7 @@ bool isFirebaseRevokedError(const String& err);
 void requestFirebaseReinit(const String& reason);
 void noteFirebaseDataSuccess();
 void noteFirebaseDataFailure(const String& operation, const String& error, int httpCode = 0);
+void noteFirebaseHeartbeatSuccess();
 void clearForcedOffPersistedInFirebase();
 ScheduleStatus evaluateScheduleStatus(const struct tm& t);
 
@@ -40,9 +43,94 @@ static uint8_t firebaseDataFailureCount = 0;
 static uint8_t firebaseStreamFailureCount = 0;
 static unsigned long firebaseRetryNotBeforeMillis = 0;
 static unsigned long firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MIN_MS;
+static unsigned long lastForcedWiFiRecoveryMillis = 0;
+static bool tokenDiagnosticPending = false;
+static void setNetAuthState(uint8_t s);
+
+static const char* firebaseTokenStatusName(firebase_auth_token_status status) {
+  switch (status) {
+    case token_status_uninitialized: return "uninitialized";
+    case token_status_on_initialize: return "initializing";
+    case token_status_on_signing: return "signing";
+    case token_status_on_request: return "requesting";
+    case token_status_on_refresh: return "refreshing";
+    case token_status_ready: return "ready";
+    case token_status_error: return "error";
+    default: return "unknown";
+  }
+}
+
+void firebaseTokenStatusCallback(TokenInfo info) {
+  const String status = firebaseTokenStatusName(info.status);
+  const bool statusChanged = lastFirebaseTokenStatus != status;
+  lastFirebaseTokenStatus = status;
+  lastFirebaseTokenErrorCode = info.error.code;
+  lastFirebaseTokenError = info.error.message.c_str();
+
+  if (statusChanged || info.status == token_status_error) {
+    Serial.printf("Firebase token: %s", status.c_str());
+    if (info.status == token_status_error) {
+      Serial.printf(" (code %d: %s)", info.error.code,
+                    info.error.message.c_str());
+      tokenDiagnosticPending = true;
+    }
+    Serial.println();
+  }
+}
 
 static bool deadlineReached(unsigned long now, unsigned long deadline) {
   return deadline == 0 || (long)(now - deadline) >= 0;
+}
+
+static void noteNetworkOutageStarted() {
+  if (networkOutageSinceMillis == 0) {
+    const unsigned long now = millis();
+    networkOutageSinceMillis = now == 0 ? 1 : now;
+  }
+}
+
+static unsigned long firebaseRecoveryJitterMs() {
+  if (RECOVERY_JITTER_MAX_MS == 0) return 0;
+  const uint64_t mac = ESP.getEfuseMac();
+  return (unsigned long)(mac % (RECOVERY_JITTER_MAX_MS + 1));
+}
+
+static void clearFirebaseSessionObjects() {
+  if (streamAttached) {
+    Firebase.RTDB.endStream(&streamFbdo);
+  }
+  streamAttached = false;
+  streamFbdo.clear();
+  fbdo.clear();
+  Firebase.reset(&config);
+}
+
+static void forceWiFiReconnectForRecovery(const String& reason) {
+  const unsigned long now = millis();
+  if (lastForcedWiFiRecoveryMillis != 0 &&
+      (now - lastForcedWiFiRecoveryMillis) < NETWORK_RECOVERY_COOLDOWN_MS) {
+    return;
+  }
+
+  lastForcedWiFiRecoveryMillis = now == 0 ? 1 : now;
+  noteNetworkOutageStarted();
+  Serial.println("Network recovery: forcing WiFi reconnect (" + reason + ").");
+  recordPersistentDiagnostic("wifi_recovery", reason);
+  clearFirebaseSessionObjects();
+  firebaseInitialized = false;
+  startupStateLoaded = false;
+  wifiLinkUp = false;
+  setNetAuthState(NA_WAIT_WIFI);
+  WiFi.disconnect(false, false);  // Preserve provisioned credentials.
+  lastWiFiReconnectAttempt = 0;
+}
+
+static void servicePendingTokenDiagnostic() {
+  if (!tokenDiagnosticPending) return;
+  tokenDiagnosticPending = false;
+  recordPersistentDiagnostic(
+      "firebase_token",
+      String(lastFirebaseTokenErrorCode) + ":" + lastFirebaseTokenError);
 }
 
 static void setNetAuthState(uint8_t s) {
@@ -204,14 +292,18 @@ void requestFirebaseReinit(const String& reason) {
       !deadlineReached(now, firebaseRetryNotBeforeMillis)) return;
 
   firebaseRecoveryCount++;
+  if (firebaseSessionRecoveryStreak < 255) firebaseSessionRecoveryStreak++;
+  noteNetworkOutageStarted();
   Serial.println("Firebase reinit requested: " + reason);
-  streamAttached      = false;
+  recordPersistentDiagnostic("firebase_reinit", reason);
+  clearFirebaseSessionObjects();
   firebaseInitialized = false;
   startupStateLoaded  = false;
-  Firebase.RTDB.endStream(&streamFbdo);
+  firebaseUnavailableSinceMillis = 0;
   lastStreamRetryMillis = now;
   lastWiFiConnectedMillis = now;
-  firebaseRetryNotBeforeMillis = now + firebaseReinitBackoffMillis;
+  firebaseRetryNotBeforeMillis =
+      now + firebaseReinitBackoffMillis + firebaseRecoveryJitterMs();
   if (firebaseReinitBackoffMillis < FIREBASE_REINIT_BACKOFF_MAX_MS) {
     firebaseReinitBackoffMillis *= 2;
     if (firebaseReinitBackoffMillis > FIREBASE_REINIT_BACKOFF_MAX_MS) {
@@ -219,6 +311,11 @@ void requestFirebaseReinit(const String& reason) {
     }
   }
   setNetAuthState(NA_WAIT_STABLE);
+
+  if (firebaseSessionRecoveryStreak >=
+      FIREBASE_RECOVERIES_BEFORE_WIFI_RECOVERY) {
+    forceWiFiReconnectForRecovery("repeated Firebase recovery failures");
+  }
 }
 
 void noteFirebaseDataSuccess() {
@@ -227,6 +324,7 @@ void noteFirebaseDataSuccess() {
 
 void noteFirebaseDataFailure(const String& operation, const String& error, int httpCode) {
   if (isFirebaseTokenPendingError(error)) return;
+  noteNetworkOutageStarted();
   if (firebaseDataFailureCount < 255) firebaseDataFailureCount++;
 
   Serial.printf("Firebase %s failure %u/%u (HTTP %d): %s\n",
@@ -243,6 +341,7 @@ static void noteFirebaseStreamFailure(const String& operation,
                                       const String& error,
                                       int httpCode) {
   if (isFirebaseTokenPendingError(error)) return;
+  noteNetworkOutageStarted();
 
   streamAttached = false;
   Firebase.RTDB.endStream(&streamFbdo);
@@ -709,6 +808,8 @@ void reconnectWiFiNonBlocking() {
       startupStateLoaded      = false;
       firebaseInitialized     = false;
       setNetAuthState(NA_WAIT_STABLE);
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+      lastNtpSyncMillis = millis();
 
       const bool restoredConnection = wifiHasConnectedOnce;
       wifiHasConnectedOnce = true;
@@ -734,12 +835,87 @@ void reconnectWiFiNonBlocking() {
   noteWiFiReconnectFailure();
 }
 
+void serviceNetworkTime() {
+  servicePendingTokenDiagnostic();
+  if (WiFi.status() != WL_CONNECTED) {
+    // A lost network does not invalidate an already-synchronized local clock.
+    return;
+  }
+
+  const unsigned long now = millis();
+  if (lastNtpCheckMillis != 0 &&
+      (now - lastNtpCheckMillis) < NTP_VALID_CHECK_MS) {
+    return;
+  }
+  lastNtpCheckMillis = now;
+
+  struct tm currentTime;
+  if (timeIsValid(currentTime)) {
+    if (!ntpTimeValid) Serial.println("NTP: system time is valid.");
+    ntpTimeValid = true;
+    consecutiveNtpFailures = 0;
+    lastNtpValidMillis = now;
+
+    if (lastNtpSyncMillis == 0 ||
+        (now - lastNtpSyncMillis) >= NTP_RECONFIG_INTERVAL_MS) {
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+      lastNtpSyncMillis = now;
+      Serial.println("NTP: periodic resync requested.");
+    }
+    return;
+  }
+
+  ntpTimeValid = false;
+  noteNetworkOutageStarted();
+  if (lastNtpSyncMillis != 0 &&
+      (now - lastNtpSyncMillis) < NTP_RETRY_MS) {
+    return;
+  }
+
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  lastNtpSyncMillis = now;
+  if (consecutiveNtpFailures < 255) consecutiveNtpFailures++;
+  Serial.printf("NTP: time unavailable, retry %u/%u.\n",
+                consecutiveNtpFailures,
+                NTP_FAILURES_BEFORE_WIFI_RECOVERY);
+
+  if (consecutiveNtpFailures == NTP_FAILURES_BEFORE_WIFI_RECOVERY) {
+    recordPersistentDiagnostic("ntp_unavailable", "time synchronization failed");
+  }
+  if (consecutiveNtpFailures >= NTP_FAILURES_BEFORE_WIFI_RECOVERY) {
+    forceWiFiReconnectForRecovery("NTP unavailable");
+    consecutiveNtpFailures = 0;
+  }
+}
+
+void serviceNetworkRecovery() {
+  servicePendingTokenDiagnostic();
+  if (networkOutageSinceMillis == 0) return;
+
+  const unsigned long now = millis();
+  if ((now - networkOutageSinceMillis) < NETWORK_OUTAGE_RESTART_MS) return;
+
+  Serial.println("Network recovery: outage limit reached, restarting ESP safely.");
+  persistManualOverrideState();
+  recordPersistentDiagnostic("network_restart", "outage limit reached");
+  delay(100);
+  ESP.restart();
+}
+
+void noteFirebaseHeartbeatSuccess() {
+  lastHeartbeatSuccessMillis = millis();
+  consecutiveHeartbeatFailures = 0;
+  networkOutageSinceMillis = 0;
+  firebaseSessionRecoveryStreak = 0;
+}
+
 void initFirebaseIfNeeded() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (!wifiLinkUp) return;
 
-  struct tm t;
-  if (!timeIsValid(t)) return;
+  // serviceNetworkTime() performs the bounded 30-second validity check. Avoid
+  // calling getLocalTime() on every loop while a boot-time NTP request is down.
+  if (!ntpTimeValid) return;
 
   unsigned long now = millis();
 
@@ -784,12 +960,38 @@ void initFirebaseIfNeeded() {
     }
     if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
     setNetAuthState(NA_READY);
+    lastFirebaseReadyMillis = now;
+    firebaseUnavailableSinceMillis = 0;
     firebaseDataFailureCount = 0;
     firebaseStreamFailureCount = 0;
     firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MIN_MS;
     logDecisionEvent("firebase_ready", "network", acPowerState, acTempState,
                      -1, aiAutoApplyEnabled, false, "auth_ready");
     return;
+  }
+
+  if (netAuthState == NA_READY) {
+    if (Firebase.ready()) {
+      lastFirebaseReadyMillis = now;
+      if (firebaseUnavailableSinceMillis != 0) {
+        Serial.println("Firebase readiness recovered before timeout.");
+      }
+      firebaseUnavailableSinceMillis = 0;
+      return;
+    }
+
+    noteNetworkOutageStarted();
+    if (firebaseUnavailableSinceMillis == 0) {
+      firebaseUnavailableSinceMillis = now == 0 ? 1 : now;
+      Serial.println("Firebase unavailable; supervising token/session recovery.");
+      recordPersistentDiagnostic("firebase_unavailable", lastFirebaseTokenStatus);
+      return;
+    }
+
+    if ((now - firebaseUnavailableSinceMillis) >=
+        FIREBASE_READY_LOSS_TIMEOUT_MS) {
+      requestFirebaseReinit("ready state unavailable beyond timeout");
+    }
   }
 }
 
