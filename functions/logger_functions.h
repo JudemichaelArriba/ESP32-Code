@@ -4,6 +4,7 @@
 
 #include "../core/structures.h"
 #include "utility_functions.h"
+#include "persistence_functions.h"
 
 static const unsigned long DECISION_LOG_FAILURE_COOLDOWN_MS = 5UL * 60UL * 1000UL;
 
@@ -27,7 +28,10 @@ static void addCommonDecisionFields(FirebaseJson& json, const String& eventType)
 static bool pushDecisionLog(FirebaseJson& json) {
   if (!canWriteDecisionLogToFirebase()) return false;
 
-  if (Firebase.RTDB.pushJSON(&fbdo, "/decisionLogs", &json)) {
+  markRuntimeOperation("firebase_decision_log");
+  bool written = Firebase.RTDB.pushJSON(&fbdo, "/decisionLogs", &json);
+  clearRuntimeOperation();
+  if (written) {
     return true;
   }
 
@@ -97,7 +101,10 @@ bool writeMlSuggestion(int suggestedTemp, bool applied, const String& reason) {
   json.set("updatedAt", nowIsoString());
 
   String path = "/devices/" + String(DEVICE_ID) + "/mlSuggestion";
-  if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
+  markRuntimeOperation("firebase_ml_log");
+  bool written = Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
+  if (written) {
     return true;
   }
 

@@ -1,6 +1,7 @@
 #include "core/structures.h"
 #include "functions/wifi_functions.h"
 #include "functions/utility_functions.h"
+#include "functions/persistence_functions.h"
 #include "functions/logger_functions.h"
 #include "functions/firebase_functions.h"
 #include "functions/energy_functions.h"
@@ -56,6 +57,7 @@ bool aiAutoApplyEnabled   = false;
 bool streamAttached      = false;
 bool firebaseInitialized = false;
 bool startupStateLoaded  = false;
+bool restoredManualOverridePendingApply = false;
 
 unsigned long lastDhtReadMillis            = 0;
 unsigned long lastMlxReadMillis            = 0;
@@ -70,8 +72,6 @@ int  lastCheckedMinuteStamp    = -1;
 bool minuteGateInitialized     = false;
 bool wifiLinkUp                = false;
 bool wifiHasConnectedOnce      = false;
-bool wifiReconnectRestartPending = false;
-unsigned long wifiReconnectStableSince = 0;
 uint8_t       netAuthState     = 0;
 unsigned long netAuthStateSince = 0;
 String lastScheduleMode        = "boot";
@@ -92,7 +92,13 @@ bool sensorWindowActive = false;
 bool mlxAvailable = false;
 unsigned long lastMlxInitAttemptMillis = 0;
 RTC_DATA_ATTR uint32_t bootCount = 0;
+RTC_DATA_ATTR RuntimeBreadcrumb runtimeBreadcrumb;
 uint32_t firebaseRecoveryCount = 0;
+uint8_t startupStateFailureCount = 0;
+bool previousResetBreadcrumbAvailable = false;
+uint32_t previousResetUptimeMs = 0;
+uint32_t previousResetBootNumber = 0;
+char previousResetOperation[40] = "";
 
 StreamPendingAction streamPendingAction;
 
@@ -106,9 +112,11 @@ static void initializeLoopWatchdog() {
   // so subscribing its idle task would cause false watchdog resets.
   watchdogConfig.idle_core_mask = 0;
   watchdogConfig.trigger_panic = true;
-  esp_err_t initResult = esp_task_wdt_init(&watchdogConfig);
+  // Arduino already initializes TWDT on current ESP32 cores. Reconfigure it
+  // first to avoid the noisy "TWDT already initialized" error.
+  esp_err_t initResult = esp_task_wdt_reconfigure(&watchdogConfig);
   if (initResult == ESP_ERR_INVALID_STATE) {
-    initResult = esp_task_wdt_reconfigure(&watchdogConfig);
+    initResult = esp_task_wdt_init(&watchdogConfig);
   }
 #else
   esp_err_t initResult = esp_task_wdt_init(LOOP_WATCHDOG_TIMEOUT_MS / 1000U, true);
@@ -339,35 +347,19 @@ void checkOverrideExpiry() {
   struct tm now;
   if (!timeIsValid(now)) return;
 
-  int yr, mo, dy, hr, mn, sc;
-  String s = manualOverrideUntil;
-  s.replace("Z", "");
-  int dotIdx = s.indexOf('.');
-  if (dotIdx > 0) s = s.substring(0, dotIdx);
-  if (sscanf(s.c_str(), "%d-%d-%dT%d:%d:%d", &yr, &mo, &dy, &hr, &mn, &sc) != 6) return;
+  time_t expiryEpoch;
+  if (!parseIso8601ToEpoch(manualOverrideUntil, expiryEpoch)) {
+    Serial.println("Override expiry: invalid timestamp, keeping override active.");
+    return;
+  }
 
-  struct tm expiryLocal = {};
-  expiryLocal.tm_year  = yr - 1900;
-  expiryLocal.tm_mon   = mo - 1;
-  expiryLocal.tm_mday  = dy;
-  expiryLocal.tm_hour  = hr + (int)(GMT_OFFSET_SEC / 3600);
-  expiryLocal.tm_min   = mn;
-  expiryLocal.tm_sec   = sc;
-  expiryLocal.tm_isdst = 0;
-  mktime(&expiryLocal);
-
-  int nowDayStamp    = now.tm_year * 366 + now.tm_yday;
-  int expiryDayStamp = expiryLocal.tm_year * 366 + expiryLocal.tm_yday;
-  int nowMin         = now.tm_hour * 60 + now.tm_min;
-  int expiryMin      = expiryLocal.tm_hour * 60 + expiryLocal.tm_min;
-
-  bool expired = (nowDayStamp > expiryDayStamp) ||
-                 (nowDayStamp == expiryDayStamp && nowMin >= expiryMin);
+  const bool expired = time(nullptr) >= expiryEpoch;
 
   if (expired) {
     Serial.println("Override expired, clearing and turning AC off.");
     manualOverrideActive = false;
     manualOverrideUntil  = "";
+    persistManualOverrideState();
     applyAcState(false, acTempState, "override_expired");
     clearOverrideInFirebase();
   }
@@ -397,7 +389,10 @@ void processPendingStreamAction() {
 
     String base = "/devices/" + String(DEVICE_ID) + "/control";
     lastEspControlWriteMillis = millis();
-    if (!Firebase.RTDB.updateNode(&fbdo, base, &patch)) {
+    markRuntimeOperation("firebase_control_ack");
+    bool acknowledged = Firebase.RTDB.updateNode(&fbdo, base, &patch);
+    clearRuntimeOperation();
+    if (!acknowledged) {
       String err = fbdo.errorReason();
       Serial.println("Control stream ack failed: " + err);
       if (!isFirebaseTokenPendingError(err) && isFirebaseAuthOrSslError(err)) {
@@ -413,7 +408,9 @@ void processPendingStreamAction() {
 
 void setup() {
   Serial.begin(115200);
+  capturePreviousResetBreadcrumb();
   bootCount++;
+  restoreManualOverrideFromPreferences();
 
   dht.begin();
 
@@ -450,7 +447,20 @@ void setup() {
     delay(500);
     retry++;
   }
-  Serial.println("\nTime synced.");
+  if (timeIsValid(timeinfo)) {
+    Serial.println("\nTime synced.");
+  } else {
+    Serial.println("\nTime sync unavailable; Firebase will wait and retry.");
+  }
+
+  if (restoredManualOverridePendingApply && manualOverrideActive) {
+    checkOverrideExpiry();
+    if (manualOverrideActive) {
+      Serial.println("Applying persisted manual override before Firebase startup.");
+      applyAcState(manualOverridePower, manualOverrideTargetTemp, "manual_restore", true);
+    }
+    restoredManualOverridePendingApply = false;
+  }
   initializeLoopWatchdog();
 }
 
@@ -468,24 +478,34 @@ void loop() {
   if (firebaseInitialized && Firebase.ready()) {
     if (!startupStateLoaded) {
       if (fetchAssignedRoomFromFirebase()) {
-        loadAcStateFromFirebase();
+        bool acStateLoaded = loadAcStateFromFirebase();
         struct tm startupTime;
         bool startupTimeValid = timeIsValid(startupTime);
         if (startupTimeValid) {
           currentScheduleStatus = evaluateScheduleStatus(startupTime);
         }
-        loadControlStateFromFirebase();
-        loadEnergyProfileFromFirebase();
-        loadEnergyStateFromFirebase();
-        syncAcStateToFirebase();
-        syncEnergyProfileToFirebase();
-        initializeEnergyTrackingForCurrentState();
-        startupStateLoaded = true;
-        logDecisionEvent("boot", "startup", acPowerState, acTempState,
-                         -1, aiAutoApplyEnabled, false, "startup_state_loaded");
+        bool controlStateLoaded = loadControlStateFromFirebase();
+        if (!acStateLoaded || !controlStateLoaded) {
+          if (startupStateFailureCount < 255) startupStateFailureCount++;
+          Serial.println("Startup state incomplete; retaining safe local state and retrying.");
+          if (startupStateFailureCount >= FIREBASE_FAILURES_BEFORE_REINIT) {
+            startupStateFailureCount = 0;
+            requestFirebaseReinit("startup state restore failed");
+          }
+        } else {
+          startupStateFailureCount = 0;
+          loadEnergyProfileFromFirebase();
+          loadEnergyStateFromFirebase();
+          syncAcStateToFirebase();
+          syncEnergyProfileToFirebase();
+          initializeEnergyTrackingForCurrentState();
+          startupStateLoaded = true;
+          logDecisionEvent("boot", "startup", acPowerState, acTempState,
+                           -1, aiAutoApplyEnabled, false, "startup_state_loaded");
 
-        if (startupTimeValid) {
-          runMinuteControl(startupTime);
+          if (startupTimeValid) {
+            runMinuteControl(startupTime);
+          }
         }
       }
     }
@@ -498,7 +518,9 @@ void loop() {
     processPendingStreamAction();
   }
 
-  checkMinuteTickAndRunControl();
+  if (startupStateLoaded) {
+    checkMinuteTickAndRunControl();
+  }
 
   struct tm _tCheck;
   if (timeIsValid(_tCheck)) {

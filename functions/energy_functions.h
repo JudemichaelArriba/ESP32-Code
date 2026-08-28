@@ -4,6 +4,7 @@
 
 #include "../core/structures.h"
 #include "utility_functions.h"
+#include "persistence_functions.h"
 
 void loadEnergyProfileFromFirebase();
 void syncEnergyProfileToFirebase();
@@ -47,7 +48,10 @@ static bool loadEnergyDailyCache(const String& dateKey) {
   }
 
   String path = energyBasePath() + "/energyDaily/" + dateKey;
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) {
+  markRuntimeOperation("firebase_energy_daily_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
     return true;
   }
 
@@ -84,7 +88,10 @@ static bool syncEnergyDailyCache() {
   json.set("updatedAt", nowIsoString());
 
   String path = energyBasePath() + "/energyDaily/" + energyDailyCache.dateKey;
-  return Firebase.RTDB.setJSON(&fbdo, path, &json);
+  markRuntimeOperation("firebase_energy_daily_write");
+  bool written = Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
+  return written;
 }
 
 static bool syncEnergyStateToFirebase() {
@@ -102,7 +109,10 @@ static bool syncEnergyStateToFirebase() {
   json.set("updatedAt", nowIsoString());
 
   String path = energyBasePath() + "/energyState";
-  return Firebase.RTDB.setJSON(&fbdo, path, &json);
+  markRuntimeOperation("firebase_energy_state_write");
+  bool written = Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
+  return written;
 }
 
 static void startEnergySession(const String& source) {
@@ -226,7 +236,10 @@ void loadEnergyProfileFromFirebase() {
   }
 
   String path = energyBasePath() + "/energyProfile";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) {
+  markRuntimeOperation("firebase_energy_profile_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
     return;
   }
 
@@ -254,7 +267,9 @@ void syncEnergyProfileToFirebase() {
   json.set("updatedAt", nowIsoString());
 
   String path = energyBasePath() + "/energyProfile";
+  markRuntimeOperation("firebase_energy_profile_write");
   Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
 }
 
 void loadEnergyStateFromFirebase() {
@@ -265,7 +280,10 @@ void loadEnergyStateFromFirebase() {
   }
 
   String path = energyBasePath() + "/energyState";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) {
+  markRuntimeOperation("firebase_energy_state_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
     return;
   }
 

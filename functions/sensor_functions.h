@@ -3,6 +3,7 @@
 #define SENSOR_FUNCTIONS_H
 
 #include "../core/structures.h"
+#include "persistence_functions.h"
 
 void pushOccupancyIfChanged();
 bool pushOccupancyToFirebase(bool force);
@@ -43,7 +44,14 @@ bool pushOccupancyToFirebase(bool force) {
   if (!canWriteSensorDataToFirebase()) return false;
 
   String basePath = "/devices/" + String(DEVICE_ID);
-  return Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
+  markRuntimeOperation("firebase_occupancy");
+  bool written = Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
+  clearRuntimeOperation();
+  if (!written) {
+    // Preserve the previous reported value so the next loop retries the change.
+    lastPresenceReported = !presenceDetected;
+  }
+  return written;
 }
 
 void pushOccupancyIfChanged() {
@@ -145,8 +153,10 @@ void refreshSensorsAndOccupancy() {
 
       if (shouldPublish && canWriteSensorDataToFirebase()) {
         String basePath = "/devices/" + String(DEVICE_ID);
+        markRuntimeOperation("firebase_sensor_write");
         Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
         Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+        clearRuntimeOperation();
       }
     }
   }
@@ -194,8 +204,10 @@ bool forceReadDhtNow() {
 
   if (shouldPublish && canWriteSensorDataToFirebase()) {
     String basePath = "/devices/" + String(DEVICE_ID);
+    markRuntimeOperation("firebase_sensor_write");
     Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
     Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+    clearRuntimeOperation();
   }
   
   return true;
@@ -227,15 +239,20 @@ bool callRenderMLAndGetTarget(int& targetTempOut) {
   serializeJson(doc, body);
   Serial.println("ML: sending request -> " + body);
 
+  http.setConnectTimeout(FIREBASE_SOCKET_TIMEOUT_MS);
+  http.setTimeout(FIREBASE_SERVER_RESPONSE_TIMEOUT_MS);
+  markRuntimeOperation("ml_http_request");
   int code = http.POST(body);
   if (code <= 0) {
     Serial.printf("ML: HTTP POST failed (%d)\n", code);
     http.end();
+    clearRuntimeOperation();
     return false;
   }
 
   String response = http.getString();
   http.end();
+  clearRuntimeOperation();
   Serial.printf("ML: HTTP %d response: %s\n", code, response.c_str());
 
   DynamicJsonDocument res(1024);

@@ -4,6 +4,7 @@
 
 #include "../core/structures.h"
 #include "utility_functions.h"
+#include "persistence_functions.h"
 #include "firebase_functions.h"
 #include <esp_system.h>
 
@@ -42,14 +43,23 @@ void tickHeartbeat() {
   json.set("minimumFreeHeap", (int)ESP.getMinFreeHeap());
   json.set("firebaseRecoveryCount", (int)firebaseRecoveryCount);
   json.set("mlxAvailable", mlxAvailable);
+  if (previousResetBreadcrumbAvailable) {
+    json.set("previousResetOperation", String(previousResetOperation));
+    json.set("previousResetUptimeMs", (int)previousResetUptimeMs);
+    json.set("previousResetBootNumber", (int)previousResetBootNumber);
+  }
 
   String path = "/devices/" + String(DEVICE_ID) + "/status";
 
-  if (Firebase.RTDB.setJSON(&fbdo, path, &json)) {
+  markRuntimeOperation("firebase_heartbeat");
+  bool written = Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
+  if (written) {
     Serial.println("Heartbeat: OK");
     lastHeartbeatMillis = now;
     lastHeartbeatAttemptMillis = 0;
     noteFirebaseDataSuccess();
+    previousResetBreadcrumbAvailable = false;
   } else {
     String err = fbdo.errorReason();
     Serial.println("Heartbeat: write failed (" + err + ")");

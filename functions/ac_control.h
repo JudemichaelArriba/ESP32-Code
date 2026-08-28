@@ -4,6 +4,7 @@
 
 #include "../core/structures.h"
 #include "utility_functions.h"
+#include "persistence_functions.h"
 #include "firebase_functions.h"
 #include "energy_functions.h"
 #include "logger_functions.h"
@@ -120,6 +121,7 @@ void applyControlJson(JsonVariant data) {
     }
     applyAcState(manualOverridePower, manualOverrideTargetTemp, "manual");
   }
+  persistManualOverrideState();
 }
 
 #endif

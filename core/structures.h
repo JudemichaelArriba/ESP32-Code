@@ -73,6 +73,13 @@ struct StreamPendingAction {
   char forcedOffWindowKey[96]  = "";
 };
 
+struct RuntimeBreadcrumb {
+  uint32_t magic;
+  uint32_t uptimeMs;
+  uint32_t bootNumber;
+  char operation[40];
+};
+
 // Global objects
 extern DHT dht;
 extern FirebaseData fbdo;
@@ -119,6 +126,7 @@ extern bool aiAutoApplyEnabled;
 extern bool streamAttached;
 extern bool firebaseInitialized;
 extern bool startupStateLoaded;
+extern bool restoredManualOverridePendingApply;
 
 extern unsigned long lastDhtReadMillis;
 extern unsigned long lastMlxReadMillis;
@@ -133,8 +141,6 @@ extern int lastCheckedMinuteStamp;
 extern bool minuteGateInitialized;
 extern bool wifiLinkUp;
 extern bool wifiHasConnectedOnce;
-extern bool wifiReconnectRestartPending;
-extern unsigned long wifiReconnectStableSince;
 extern String lastScheduleMode;
 extern String lastScheduleWindowKey;
 
@@ -153,6 +159,11 @@ extern bool mlxAvailable;
 extern unsigned long lastMlxInitAttemptMillis;
 extern uint32_t bootCount;
 extern uint32_t firebaseRecoveryCount;
+extern RuntimeBreadcrumb runtimeBreadcrumb;
+extern bool previousResetBreadcrumbAvailable;
+extern uint32_t previousResetUptimeMs;
+extern uint32_t previousResetBootNumber;
+extern char previousResetOperation[40];
 
 // Deferred stream action (defined in main.ino)
 extern StreamPendingAction streamPendingAction;

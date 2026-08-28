@@ -104,6 +104,7 @@ ESP32-Code/
    |- firebase_functions.h
    |- heartbeat_functions.h
    |- logger_functions.h
+   |- persistence_functions.h
    |- schedule_functions.h
    |- sensor_functions.h
    |- utility_functions.h
@@ -121,19 +122,20 @@ ESP32-Code/
 - `energy_functions.h`: Runtime session tracking and estimated energy usage.
 - `heartbeat_functions.h`: Device status heartbeat updates.
 - `logger_functions.h`: Decision, ML, and AC state logs.
+- `persistence_functions.h`: Manual-override NVS storage and reset breadcrumbs retained across software resets.
 - `utility_functions.h`: Time helpers, schedule parsing, PIR ISR, and AC temperature normalization.
 - `structures.h`: Shared includes, structs, and global extern declarations.
 
 ## Runtime Flow
 
-1. Initialize serial, sensors, PIR interrupt, and IR transmitter.
+1. Initialize serial, sensors, PIR interrupt, and IR transmitter, then restore any persisted manual override from NVS.
 2. Configure device identity and backend service access.
 3. Run WiFiManager provisioning through `setupWiFiProvisioning()`.
 4. Sync NTP time.
 5. In the main loop:
    - service the WiFi reset button
    - keep WiFi and Firebase connected
-   - load startup room/control/energy state once Firebase is ready
+   - load startup room/control/energy state once Firebase is ready; schedule control remains gated until critical state is restored
    - attach and poll the Firebase control stream
    - run minute-based schedule control
    - expire manual overrides when needed
@@ -173,7 +175,8 @@ The firmware reads or writes these main paths:
 
 The device status heartbeat includes `lastSeen`, IP address, firmware version,
 boot/reset information, current and minimum free heap, Firebase recovery count,
-and MLX90614 availability.
+MLX90614 availability, and the previous blocking operation when a software reset
+occurred during a marked network request.
 
 ## Production Notes
 
@@ -181,5 +184,7 @@ and MLX90614 availability.
 - Do not call `wm.resetSettings()` automatically during normal WiFi failure; the firmware only clears credentials through the reset button path.
 - Existing schedule, manual override, Firebase, sensor, and AC control flows are gated by WiFi/Firebase readiness checks.
 - Firebase stream failures are retried before escalating to a full Firebase reinitialization with bounded backoff.
+- Manual override state is stored in NVS only when it changes, restored before Firebase authentication, and reconciled with Firebase after startup.
+- WiFi restoration rebuilds the Firebase session without deliberately rebooting the ESP32.
 - A loop watchdog recovers from a blocked network operation, and MLX90614 initialization failure no longer blocks network startup.
 - All function modules are header-only and are compiled through includes from `ESP32-Code.ino`.

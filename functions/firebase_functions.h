@@ -5,14 +5,15 @@
 #include "../core/structures.h"
 #include "wifi_functions.h"
 #include "utility_functions.h"
+#include "persistence_functions.h"
 #include "logger_functions.h"
 
 void setControlStateToFirebase(bool active);
 bool fetchAssignedRoomFromFirebase();
 void syncAcStateToFirebase();
-void loadAcStateFromFirebase();
+bool loadAcStateFromFirebase();
 void applyControlJson(JsonVariant data);
-void loadControlStateFromFirebase();
+bool loadControlStateFromFirebase();
 void ensureControlStream();
 void pollControlStream();
 void reconnectWiFiNonBlocking();
@@ -133,6 +134,7 @@ static void queueForcedOffTrigger(const String& logPrefix) {
   setForcedOffForCurrentWindow();
   manualOverrideActive = false;
   manualOverrideUntil = "";
+  persistManualOverrideState();
 
   queueAcStreamAction(false, acTempState, "forced_off");
   queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
@@ -147,7 +149,10 @@ static bool updateControlPatch(FirebaseJson& patch) {
   String base = "/devices/" + String(DEVICE_ID) + "/control";
   lastEspControlWriteMillis = millis();
 
-  if (Firebase.RTDB.updateNode(&fbdo, base, &patch)) {
+  markRuntimeOperation("firebase_control_patch");
+  bool updated = Firebase.RTDB.updateNode(&fbdo, base, &patch);
+  clearRuntimeOperation();
+  if (updated) {
     noteFirebaseDataSuccess();
     return true;
   }
@@ -257,7 +262,14 @@ static void noteFirebaseStreamFailure(const String& operation,
 void setControlStateToFirebase(bool active) {
   String controlPath = "/devices/" + String(DEVICE_ID) + "/control/overrideActive";
   lastEspControlWriteMillis = millis();
-  Firebase.RTDB.setBool(&fbdo, controlPath, active);
+  markRuntimeOperation("firebase_control_write");
+  bool written = Firebase.RTDB.setBool(&fbdo, controlPath, active);
+  clearRuntimeOperation();
+  if (written) {
+    noteFirebaseDataSuccess();
+  } else {
+    noteFirebaseDataFailure("control_write", fbdo.errorReason(), fbdo.httpCode());
+  }
 }
 
 void clearForcedOffPersistedInFirebase() {
@@ -285,7 +297,10 @@ bool fetchAssignedRoomFromFirebase() {
   if ((now - lastRoomsFetchAttemptMillis) < ROOMS_FETCH_RETRY_MS)    return false;
   lastRoomsFetchAttemptMillis = now;
 
-  if (!Firebase.RTDB.getJSON(&fbdo, "/rooms")) {
+  markRuntimeOperation("firebase_rooms_read");
+  bool roomsRead = Firebase.RTDB.getJSON(&fbdo, "/rooms");
+  clearRuntimeOperation();
+  if (!roomsRead) {
     String err = fbdo.errorReason();
     Serial.println("Failed to read /rooms: " + err);
     noteFirebaseDataFailure("rooms_read", err, fbdo.httpCode());
@@ -350,29 +365,60 @@ void syncAcStateToFirebase() {
     json.set("roomUid", assignedRoom.uid);
   }
 
-  if (!Firebase.RTDB.setJSON(&fbdo, basePath, &json)) {
-    Serial.println("Failed to sync acState: " + fbdo.errorReason());
+  markRuntimeOperation("firebase_ac_write");
+  bool written = Firebase.RTDB.setJSON(&fbdo, basePath, &json);
+  clearRuntimeOperation();
+  if (!written) {
+    String err = fbdo.errorReason();
+    Serial.println("Failed to sync acState: " + err);
+    noteFirebaseDataFailure("ac_state_write", err, fbdo.httpCode());
+  } else {
+    noteFirebaseDataSuccess();
   }
 }
 
-void loadAcStateFromFirebase() {
+bool loadAcStateFromFirebase() {
   String path = "/devices/" + String(DEVICE_ID) + "/acState";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) return;
+  markRuntimeOperation("firebase_ac_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
+    String err = fbdo.errorReason();
+    Serial.println("Failed to load acState: " + err);
+    noteFirebaseDataFailure("ac_state_read", err, fbdo.httpCode());
+    return false;
+  }
 
   DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
+  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) {
+    Serial.println("Failed to parse acState JSON.");
+    return false;
+  }
 
   if (!doc["power"].isNull())       acPowerState = doc["power"].as<bool>();
   if (!doc["currentTemp"].isNull()) acTempState  = normalizeACTemp((float)doc["currentTemp"].as<int>());
   acIrStateTrusted = false;
+  noteFirebaseDataSuccess();
+  return true;
 }
 
-void loadControlStateFromFirebase() {
+bool loadControlStateFromFirebase() {
   String path = "/devices/" + String(DEVICE_ID) + "/control";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) return;
+  markRuntimeOperation("firebase_control_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
+    String err = fbdo.errorReason();
+    Serial.println("Failed to load control state: " + err);
+    noteFirebaseDataFailure("control_state_read", err, fbdo.httpCode());
+    return false;
+  }
 
   DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
+  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) {
+    Serial.println("Failed to parse control state JSON.");
+    return false;
+  }
   JsonVariant control = doc.as<JsonVariant>();
 
   loadAiAutoApplyFromControl(control, "startup_load", true);
@@ -393,6 +439,7 @@ void loadControlStateFromFirebase() {
     manualOverrideUntil = "";
 
   manualOverridePower = resolveManualOverridePower(control, manualOverrideActive);
+  manualOverrideTemp = manualOverrideTargetTemp;
 
   String persistedWindowKey = "";
   if (!control["forcedOffWindowKey"].isNull()) {
@@ -409,6 +456,7 @@ void loadControlStateFromFirebase() {
     setForcedOffForCurrentWindow();
     manualOverrideActive = false;
     manualOverrideUntil = "";
+    persistManualOverrideState();
 
     FirebaseJson patch;
     patch.set("forcedOffPersisted", forcedOffActive);
@@ -420,7 +468,8 @@ void loadControlStateFromFirebase() {
     logDecisionEvent("forced_off_trigger", "forced_off", false, acTempState,
                      -1, aiAutoApplyEnabled, true,
                      forcedOffActive ? "startup_window_locked" : "startup_no_active_window");
-    return;
+    noteFirebaseDataSuccess();
+    return true;
   }
 
   if (hasForcedOffPersisted) {
@@ -437,12 +486,17 @@ void loadControlStateFromFirebase() {
       clearForcedOffPersistedInFirebase();
       Serial.println("Startup: stale forcedOff persistence cleared.");
     }
-    return;
+    persistManualOverrideState();
+    noteFirebaseDataSuccess();
+    return true;
   }
 
   if (persistedWindowKey.length() > 0) {
     clearForcedOffPersistedInFirebase();
   }
+  persistManualOverrideState();
+  noteFirebaseDataSuccess();
+  return true;
 }
 
 static void handleControlJsonSnapshot(const String& payload) {
@@ -473,6 +527,7 @@ static void handleControlJsonSnapshot(const String& payload) {
     manualOverrideUntil = v["overrideUntil"].as<String>();
 
   manualOverridePower = resolveManualOverridePower(v, manualOverrideActive);
+  manualOverrideTemp = manualOverrideTargetTemp;
 
   if (manualOverrideActive) {
     if (forcedOffActive) {
@@ -495,16 +550,11 @@ static void handleControlJsonSnapshot(const String& payload) {
     logDecisionEvent("manual_override", "manual", false, acTempState,
                      -1, aiAutoApplyEnabled, false, "stream_json_off");
   }
+  persistManualOverrideState();
 }
 
 static void handleControlStreamEvent(const String& path, const String& type) {
   Serial.println("Stream update: " + path + " [" + type + "]");
-
-  if (lastEspControlWriteMillis > 0 &&
-      (millis() - lastEspControlWriteMillis) < 4000) {
-    Serial.println("Stream: Ignoring echo from ESP's own write.");
-    return;
-  }
 
   streamPendingAction = StreamPendingAction();
 
@@ -551,12 +601,14 @@ static void handleControlStreamEvent(const String& path, const String& type) {
                        -1, aiAutoApplyEnabled, false, "stream_off");
 
     }
+    persistManualOverrideState();
     return;
   }
 
   if ((path == "/targetTemp" || path == "/temp") &&
       (type == "int" || type == "float" || type == "double")) {
     manualOverrideTargetTemp = normalizeACTemp((float)streamFbdo.floatData());
+    manualOverrideTemp = manualOverrideTargetTemp;
     if (manualOverrideActive) {
       if (!manualOverridePower) manualOverridePower = true;
       queueAcStreamAction(manualOverridePower, manualOverrideTargetTemp, "manual");
@@ -564,11 +616,13 @@ static void handleControlStreamEvent(const String& path, const String& type) {
                        manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
                        true, "stream_temp_changed");
     }
+    persistManualOverrideState();
     return;
   }
 
   if (path == "/overrideUntil" && type == "string") {
     manualOverrideUntil = streamFbdo.stringData();
+    persistManualOverrideState();
     return;
   }
 
@@ -580,6 +634,7 @@ static void handleControlStreamEvent(const String& path, const String& type) {
                        manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
                        true, "stream_power_changed");
     }
+    persistManualOverrideState();
     return;
   }
 }
@@ -594,7 +649,10 @@ void ensureControlStream() {
   if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
 
   String streamPath = "/devices/" + String(DEVICE_ID) + "/control";
-  if (!Firebase.RTDB.beginStream(&streamFbdo, streamPath)) {
+  markRuntimeOperation("firebase_stream_begin");
+  bool began = Firebase.RTDB.beginStream(&streamFbdo, streamPath);
+  clearRuntimeOperation();
+  if (!began) {
     String err = streamFbdo.errorReason();
     Serial.println("Control stream begin failed: " + err);
     noteFirebaseStreamFailure("stream_begin", err, streamFbdo.httpCode());
@@ -608,7 +666,10 @@ void pollControlStream() {
   if (!streamAttached || !firebaseInitialized || WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   if (netAuthState != NA_READY) return;
 
-  if (!Firebase.RTDB.readStream(&streamFbdo)) {
+  markRuntimeOperation("firebase_stream_read");
+  bool streamRead = Firebase.RTDB.readStream(&streamFbdo);
+  clearRuntimeOperation();
+  if (!streamRead) {
     String err = streamFbdo.errorReason();
     if (err.length() > 0) {
       Serial.println("Control stream read failed: " + err);
@@ -649,30 +710,17 @@ void reconnectWiFiNonBlocking() {
       firebaseInitialized     = false;
       setNetAuthState(NA_WAIT_STABLE);
 
-      if (!wifiHasConnectedOnce) {
-        wifiHasConnectedOnce = true;
-      } else {
-        wifiReconnectRestartPending = true;
-        wifiReconnectStableSince    = millis();
-        Serial.println("WiFi restored, waiting stable then restarting...");
+      const bool restoredConnection = wifiHasConnectedOnce;
+      wifiHasConnectedOnce = true;
+      if (restoredConnection) {
+        Serial.println("WiFi restored; rebuilding Firebase session without rebooting.");
       }
-    }
-
-    if (wifiReconnectRestartPending &&
-        (millis() - wifiReconnectStableSince) >= WIFI_RECONNECT_RESTART_STABLE_MS) {
-      Serial.println("WiFi stable after reconnect, restarting ESP...");
-      delay(100);
-      ESP.restart();
     }
     return;
   }
 
-  if (wifiLinkUp) wifiReconnectRestartPending = false;
-
   wifiLinkUp = false;
   setNetAuthState(NA_WAIT_WIFI);
-
-  if (status == WL_IDLE_STATUS) return;
 
   unsigned long now = millis();
   if (now - lastWiFiReconnectAttempt < WIFI_RECONNECT_MS) return;
@@ -714,8 +762,10 @@ void initFirebaseIfNeeded() {
     config.timeout.rtdbStreamReconnect = FIREBASE_STREAM_RECONNECT_MS;
     config.timeout.rtdbStreamError = FIREBASE_STREAM_ERROR_MS;
 
+    markRuntimeOperation("firebase_auth");
     Firebase.begin(&config, &auth);
     Firebase.reconnectNetwork(true);
+    clearRuntimeOperation();
     firebaseInitialized    = true;
     streamAttached         = false;
     startupStateLoaded     = false;
@@ -744,12 +794,20 @@ void initFirebaseIfNeeded() {
 }
 
 void clearOverrideInFirebase() {
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   String base = "/devices/" + String(DEVICE_ID) + "/control";
   lastEspControlWriteMillis = millis();
-  Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
+  markRuntimeOperation("firebase_override_clear");
+  bool controlCleared = Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
 
   String acBase = "/devices/" + String(DEVICE_ID) + "/acState";
-  Firebase.RTDB.setString(&fbdo, acBase + "/source", "override_expired");
+  bool sourceWritten = Firebase.RTDB.setString(&fbdo, acBase + "/source", "override_expired");
+  clearRuntimeOperation();
+  if (!controlCleared || !sourceWritten) {
+    noteFirebaseDataFailure("override_clear", fbdo.errorReason(), fbdo.httpCode());
+  } else {
+    noteFirebaseDataSuccess();
+  }
 }
 
 #endif

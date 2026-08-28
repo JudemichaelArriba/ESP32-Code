@@ -33,7 +33,6 @@ const unsigned long WIFI_CONNECT_TIMEOUT_SEC = 20;
 const unsigned long WIFI_PORTAL_TIMEOUT_SEC = 300;
 const unsigned long WIFI_RECONNECT_MS = 5000;
 const uint8_t WIFI_MAX_RECONNECT_FAILURES = 36;
-const unsigned long WIFI_RECONNECT_RESTART_STABLE_MS = 8000;
 const unsigned long WIFI_RESET_HOLD_MS = 5UL * 1000UL;
 const unsigned long NTP_RESYNC_MS = 60000;
 const unsigned long WIFI_STABLE_BEFORE_FB_MS = 5000;
@@ -64,6 +63,8 @@ const uint16_t IR_SEND_REPEAT_DELAY_MS = 200;
 const unsigned long HEARTBEAT_INTERVAL_MS = 60UL * 1000UL;
 const unsigned long HEARTBEAT_FAILURE_RETRY_MS = 10UL * 1000UL;
 const unsigned long MLX_REINIT_INTERVAL_MS = 30UL * 1000UL;
-const uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 45UL * 1000UL;
-const char* FIRMWARE_VERSION = "2026.08.27-recovery1";
+// Firebase's synchronous TLS handshake can legitimately take about 60 seconds.
+// Keep the watchdog above that ceiling while still recovering a truly stuck loop.
+const uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 120UL * 1000UL;
+const char* FIRMWARE_VERSION = "2026.08.28-recovery2";
 #endif
