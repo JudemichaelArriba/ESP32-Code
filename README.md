@@ -178,7 +178,12 @@ fields. It also includes the server-resolved `lastSeenServer` timestamp, firmwar
 version, boot/reset information, current and minimum free heap, Firebase and
 heartbeat recovery counters, NTP/token status, MLX90614 availability, recent
 persistent recovery diagnostics, and the previous blocking operation when a
-software reset occurred during a marked network request.
+software reset occurred during a marked network request. The nested
+`status/occupancyDiagnostics` object reports the live PIR/MLX contributors,
+the unified five-minute occupancy hold, last-presence age, sensor-reading
+validity, and whether an occupancy value is still pending publication; the
+web-compatible `/occupancy` boolean is unchanged. The active-schedule empty-room
+grace uses the same five-minute duration, so the two delays do not stack.
 
 ## Production Notes
 

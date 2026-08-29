@@ -6,6 +6,8 @@ OcuTemp is production-grade ESP32 firmware for room air-conditioner automation. 
 
 The device operates as a deployed room controller with WiFi provisioning separate from AC control logic, enabling network changes without reflashing firmware.
 
+Current production baseline: `2026.08.29-recovery3-occupancy2`. Build for an ESP32 Dev Module with the `Huge APP (3 MB No OTA/1 MB SPIFFS)` partition scheme. The current image does not fit the default application partition, and the deployed layout does not support OTA.
+
 ---
 
 ## Core Product Principles
@@ -73,9 +75,12 @@ All global objects and state variables are declared in `structures.h` with `exte
 - `EnergyRuntimeState energyRuntimeState`: Current energy tracking session
 - `EnergyDailyCache energyDailyCache`: Daily runtime and kWh accumulator
 - `acPowerState`, `acTempState`, `acSourceState`: AC state mirror
-- `manualOverrideActive`, `manualOverridePower`, `manualOverrideTemp`: Manual control state
+- `manualOverrideActive`, `manualOverridePower`, `manualOverrideTargetTemp`, `manualOverrideUntil`: Manual control state
 - `forcedOffActive`, `forcedOffWindowKey`: Schedule window lock for forced-off
 - `presenceDetected`, `pirMotionDetected`, `mlxPresenceDetected`: Occupancy state
+- `lastPresenceReported`, `occupancyPublishPending`, `lastOccupancyPublishAttemptMillis`: Confirmed Firebase occupancy synchronization state
+- `firebaseRecoveryCount`, `firebaseSessionRecoveryStreak`, heartbeat/NTP counters: Network recovery diagnostics
+- `runtimeBreadcrumb`, `previousResetOperation`, persistent diagnostic history: Reset diagnostics
 - `streamPendingAction`: Deferred Firebase control stream actions
 
 ### Modules
@@ -84,14 +89,17 @@ All global objects and state variables are declared in `structures.h` with `exte
 - WiFiManager captive portal provisioning
 - Saved credentials in ESP32 flash/NVS
 - Reset button held 5s clears credentials and restarts
-- Reconnect failure escalation (36 failures → restart into provisioning)
+- Runtime reconnect every 5s; 36 failed attempts trigger a restart into the saved-credential/provisioning boot flow
+- Automatic recovery never erases saved credentials
 
 **firebase_functions.h**
-- Firebase init with auth settle delay
+- Firebase authentication state machine with WiFi stability wait, bounded timeouts, retry backoff, and device-specific jitter
 - Room assignment fetch
 - AC state sync
 - Control stream (polling Firebase Realtime Database for remote commands)
 - Manual override, forced-off, AI toggle handling
+- Supervises `Firebase.ready()` loss, rebuilds the complete Firebase session, escalates repeated failures to a WiFi reconnect, and safely restarts after a continuous outage
+- NTP validity monitoring and recovery
 
 **schedule_functions.h**
 - `evaluateScheduleStatus()`: checks daily schedule, pre-cool window, active window
@@ -104,9 +112,9 @@ All global objects and state variables are declared in `structures.h` with `exte
 
 **sensor_functions.h**
 - DHT22 polling (7s interval)
-- PIR motion latch with 3-minute hold
-- MLX90614 presence detection (consecutive read filtering)
-- Occupancy Firebase push
+- Unified 5-minute occupancy hold refreshed by direct PIR or confirmed MLX detection
+- MLX90614 presence detection with two-positive/two-negative filtering
+- Retry-safe occupancy publishing; a value is marked reported only after Firebase confirms the write
 - ML endpoint call for temperature suggestions
 
 **energy_functions.h**
@@ -116,7 +124,13 @@ All global objects and state variables are declared in `structures.h` with `exte
 
 **heartbeat_functions.h**
 - Periodic status heartbeat (60s interval)
-- Writes `lastSeen` timestamp and IP to Firebase
+- Writes local `lastSeen`, Firebase server timestamp `lastSeenServer`, IP, firmware/reset/network health, and occupancy diagnostics
+
+**persistence_functions.h**
+- Persists manual override state in NVS
+- Maintains a six-record diagnostic ring across resets
+- Stores an RTC operation breadcrumb around marked blocking network calls
+- Uploads saved diagnostics in the next successful heartbeat, then clears the local ring
 
 **logger_functions.h**
 - Decision event logs (`/decisionLogs`)
@@ -134,11 +148,15 @@ All global objects and state variables are declared in `structures.h` with `exte
 
 ## Boot Flow
 
-1. Serial, sensors, PIR interrupt, IR transmitter init
-2. Load device identity and Firebase credentials from `secrets.h`
-3. Run WiFiManager provisioning (captive portal if no saved credentials)
-4. Sync NTP time
-5. Enter main loop
+1. Initialize Serial and capture the previous RTC reset breadcrumb
+2. Restore persisted manual override state
+3. Initialize DHT22, PIR interrupt, MLX90614, and Coolix IR state
+4. Load device identity and Firebase credentials from `secrets.h`
+5. Connect with saved WiFi credentials; open the protected captive portal when required
+6. Request NTP synchronization
+7. Apply a still-valid persisted manual override before Firebase startup
+8. Initialize the 120-second loop-task watchdog
+9. Enter the main loop; Firebase authentication starts only after WiFi and time are usable
 
 ---
 
@@ -146,19 +164,21 @@ All global objects and state variables are declared in `structures.h` with `exte
 
 1. Service WiFi reset button
 2. Reconnect WiFi if disconnected (non-blocking)
-3. Initialize Firebase if needed (non-blocking, auth settle delay)
-4. Load startup state once Firebase ready:
+3. Validate/recover NTP and service continuous-outage recovery
+4. Advance the Firebase authentication/recovery state machine
+5. Load startup state once Firebase ready:
    - Fetch assigned room
    - Load AC state, control state, energy profile, energy state from Firebase
    - Sync AC state to Firebase
    - Initialize energy tracking
-5. Attach and poll control stream (Firebase Realtime Database polling)
-6. Process deferred stream actions (IR sends stay outside stream parsing)
-7. Run minute-based schedule control
-8. Check manual override expiry
-9. Tick energy tracking (periodic flush)
-10. Tick heartbeat
-11. Poll sensors if in sensor window (manual/pre-cool/schedule)
+6. Attach and poll control stream (Firebase Realtime Database polling)
+7. Process deferred stream actions (IR sends stay outside stream parsing)
+8. Run minute-based schedule control
+9. Check manual override expiry
+10. Tick energy tracking (periodic flush)
+11. Tick heartbeat
+12. Poll sensors only in a manual/pre-cool/schedule window; otherwise reset and publish idle occupancy false once
+13. Reset the loop-task watchdog
 
 ---
 
@@ -168,12 +188,12 @@ Schedule logic follows this priority:
 
 1. **No assigned room**: AC off
 2. **Forced off**: AC off for the active schedule window (window-locked)
-3. **Manual override**: follow `manualOverridePower` and `manualOverrideTemp`
+3. **Manual override**: follow `manualOverridePower` and `manualOverrideTargetTemp`
 4. **No schedule today**: AC off
 5. **Outside schedule window**: AC off
 6. **Pre-cool window**: AC on at `PRECOOL_TEMP` (17°C)
 7. **Active schedule**: AC on, occupancy-aware, optional ML target suggestions
-8. **Empty room past grace period**: AC off (5 minutes after schedule entry or last presence)
+8. **Empty room past grace period**: AC off when the unified 5-minute occupancy hold/grace expires; the minute gate may add less than 1 minute
 
 ---
 
@@ -184,7 +204,7 @@ Schedule logic follows this priority:
 | `/rooms` | Room assignments and schedules |
 | `/devices/{DEVICE_ID}/control` | Manual override, forced-off, AI toggle |
 | `/devices/{DEVICE_ID}/acState` | Current AC power, temp, source |
-| `/devices/{DEVICE_ID}/status` | Heartbeat (lastSeen, IP) |
+| `/devices/{DEVICE_ID}/status` | Heartbeat, server timestamp, recovery/reset health, and occupancy diagnostics |
 | `/devices/{DEVICE_ID}/occupancy` | Presence detected |
 | `/devices/{DEVICE_ID}/temperature` | DHT22 temperature |
 | `/devices/{DEVICE_ID}/humidity` | DHT22 humidity |
@@ -218,9 +238,10 @@ Schedule logic follows this priority:
 - `MLX_HUMAN_DELTA_MIN_C`: 2.0°C (object - ambient)
 - `MLX_CONFIRM_READS`: 2 consecutive positive reads
 - `MLX_CLEAR_READS`: 2 consecutive negative reads
-- `PIR_HOLD_MS`: 3 minutes
-- `OCCUPANCY_EMPTY_OFF_MS`: 20 minutes (general occupancy grace)
-- `SCHEDULE_NO_OCC_OFF_MS`: 5 minutes (schedule-specific grace)
+- `OCCUPANCY_HOLD_MS`: 5 minutes from the latest direct PIR/MLX detection
+- `PIR_HOLD_MS`: alias of the unified 5-minute hold for PIR-recent diagnostics
+- `SCHEDULE_NO_OCC_OFF_MS`: alias of the unified 5-minute hold; do not stack another grace period
+- `OCCUPANCY_EMPTY_OFF_MS`: legacy 20-minute constant; currently not used by active schedule control
 
 **Timing**
 - `DHT_INTERVAL_MS`: 7s
@@ -229,7 +250,14 @@ Schedule logic follows this priority:
 - `WIFI_RECONNECT_MS`: 5s
 - `WIFI_MAX_RECONNECT_FAILURES`: 36
 - `HEARTBEAT_INTERVAL_MS`: 60s
+- `HEARTBEAT_FAILURE_RETRY_MS`: 10s
+- `OCCUPANCY_PUBLISH_RETRY_MS`: 5s while a change is pending
 - `ENERGY_FLUSH_INTERVAL_SEC`: 60s
+- `FIREBASE_READY_LOSS_TIMEOUT_MS`: 75s
+- `NETWORK_OUTAGE_RESTART_MS`: 10 minutes
+- `LOOP_WATCHDOG_TIMEOUT_MS`: 120s
+- `NTP_VALID_CHECK_MS`: 30s
+- `NTP_RECONFIG_INTERVAL_MS`: 6 hours
 
 **WiFiManager**
 - `WIFI_PORTAL_SSID`: "OcuTemp-Setup"
@@ -238,8 +266,64 @@ Schedule logic follows this priority:
 
 ---
 
+## Occupancy State Model
+
+1. A PIR interrupt/current HIGH or filtered MLX-positive state is direct occupancy evidence.
+2. Direct evidence updates `lastPresenceDetectedMillis`.
+3. `presenceDetected` stays true for one unified 5-minute hold from the latest direct evidence.
+4. New evidence restarts that same timer; no second hold is applied.
+5. Active-schedule empty shutdown uses the same 5-minute reference. Once occupancy becomes false, the grace has already elapsed; only the once-per-minute control gate can add up to about 1 minute.
+6. Outside all sensor windows, sensor/occupancy state is reset and Firebase idle occupancy false is published once.
+
+`lastPresenceReported` means the last value Firebase actually confirmed, not the last attempted value. If Firebase is unavailable when local occupancy changes, `occupancyPublishPending` remains true and the latest local value is retried no faster than every 5 seconds after Firebase becomes usable. Never set `lastPresenceReported` before a successful RTDB write.
+
+MLX classification requires object temperature from 30-40°C, object-minus-ambient delta of at least 2°C, and two consecutive positive reads. Two consecutive negative/invalid classifications clear `mlxPresenceDetected`; the unified hold prevents UI flicker after it clears.
+
+## Heartbeat and Occupancy Diagnostics
+
+The heartbeat writes `/devices/{DEVICE_ID}/status` every 60 seconds using one `setJSON` request. The existing `/devices/{DEVICE_ID}/occupancy` boolean remains the web-app compatibility path. Adding diagnostic fields does not create extra heartbeat requests.
+
+| Field | Meaning |
+|------|---------|
+| `lastSeen` | ESP local ISO-8601 time |
+| `lastSeenServer` | Firebase server-resolved timestamp; use this to distinguish clock problems from failed writes |
+| `resetReason` | Current ESP reset category; `1` is power-on, `3` software reset, `4` panic, `6` task watchdog, `9` brownout |
+| `firebaseRecoveryCount` | Firebase session rebuilds during the current boot; not a reboot counter |
+| `firebaseRecoveryStreak` | Consecutive recovery escalation count; a successful heartbeat clears it |
+| `tokenStatus` / `tokenErrorCode` | Current Firebase token lifecycle state and an optional error code |
+| `occupancyDiagnostics/presenceDetected` | Final held occupancy value used by the firmware |
+| `occupancyDiagnostics/occupancyHoldActive` | Occupancy is true without a currently active PIR pin or MLX classification and is being retained by the 5-minute hold |
+| `occupancyDiagnostics/pirMotionDetected` | Current PIR input level |
+| `occupancyDiagnostics/pirRecentMotion` | PIR edge occurred within the 5-minute hold |
+| `occupancyDiagnostics/mlxPresenceDetected` | Filtered MLX human-like heat classification |
+| `occupancyDiagnostics/mlxReadingValid` | Object, ambient, and delta readings are all finite |
+| `occupancyDiagnostics/mlxObjectTemp` | Latest MLX object temperature in °C; null when invalid/reset |
+| `occupancyDiagnostics/mlxAmbientTemp` | Latest MLX ambient temperature in °C; null when invalid/reset |
+| `occupancyDiagnostics/mlxDeltaTemp` | Object minus ambient in °C; null when invalid/reset |
+| `occupancyDiagnostics/lastPresenceAgeMs` | Milliseconds since the latest direct PIR/MLX evidence; null when none exists in the current sensor window |
+| `occupancyDiagnostics/occupancyPublishPending` | Local `/occupancy` differs from the last confirmed Firebase value or a write still needs retrying |
+
+Interpretation rules:
+
+- `presenceDetected=true` with `occupancyHoldActive=true` is expected during the five-minute hold.
+- Persistently `pirMotionDetected=true` in an empty room suggests a stuck/noisy PIR input.
+- Repeatedly small `lastPresenceAgeMs` in an empty room suggests repeated PIR noise or an MLX false positive.
+- `mlxPresenceDetected=true` in an empty room means a warm object satisfies the configured range/delta; inspect placement and temperatures before changing thresholds.
+- Local `presenceDetected=false`, root `/occupancy=true`, and `occupancyPublishPending=true` means Firebase is temporarily stale and awaiting retry.
+
+## Network and Reset Recovery
+
+- WiFi reconnect attempts occur every 5 seconds. After 36 failures, the ESP restarts into the normal saved-credential/WiFiManager flow; credentials are not erased.
+- Firebase waits 5 seconds after WiFi stability, initializes with bounded socket/TLS/response timeouts, and allows a 20-second ready settle period.
+- Three Firebase data/stream failures request a full Firebase session rebuild. Backoff grows from 5 to 60 seconds and includes device-specific jitter.
+- If `Firebase.ready()` remains false for 75 seconds after being ready, the session is rebuilt.
+- Three consecutive Firebase session recoveries force a WiFi disconnect/reconnect without erasing credentials; this escalation has a 2-minute cooldown.
+- A successful heartbeat clears the continuous-outage timer and recovery streak. A continuous 10-minute outage persists override/diagnostic state and performs a controlled restart.
+- NTP validity is checked every 30 seconds. Invalid time is retried every 30 seconds; five failures force WiFi recovery. Normal `configTime()` reconfiguration is limited to every 6 hours or WiFi restoration.
+- The loop task is watched with a 120-second watchdog. Marked synchronous network operations leave an RTC breadcrumb that can identify the operation after a watchdog/software reset.
 
 ---
+
 
 ## Key Structs
 
@@ -301,23 +385,27 @@ struct StreamPendingAction {
 
 **Non-Blocking Operations**
 - Never use blocking WiFi reconnects
-- Never use blocking Firebase calls in loop
+- Do not add unbounded network calls. The legacy Firebase client is synchronous, so keep its socket/TLS/response timeouts, RTC breadcrumbs, retry limits, and watchdog coverage intact
 - Use state machines for multi-step operations (e.g., `netAuthState`)
 
 **State Synchronization**
 - Always sync AC state to Firebase after changes
 - Always log decision events for mode changes and AC state changes
 - Always flush energy state periodically
+- Treat `lastPresenceReported` as confirmed remote state; preserve `occupancyPublishPending` across failed/unavailable writes
 
 **Sensor Polling**
 - Only poll sensors during sensor windows (manual/pre-cool/schedule)
 - Use consecutive read filtering for MLX90614 to avoid false positives
 - Publish occupancy changes to Firebase
+- Keep `OCCUPANCY_HOLD_MS`, `PIR_HOLD_MS`, and `SCHEDULE_NO_OCC_OFF_MS` aligned unless a deliberate product decision requires different UI and AC timings
+- Update `lastPresenceDetectedMillis` only from direct PIR/MLX evidence, never from an already-held occupancy value; otherwise the hold doubles itself
 
 **Time Handling**
 - Validate time with `timeIsValid()` before using `struct tm`
-- Use NTP for time sync (60s re-sync interval)
+- Check NTP validity every 30s and limit ordinary `configTime()` reconfiguration to every 6 hours or WiFi restoration
 - Use ISO 8601 strings for Firebase timestamps
+- Use Firebase server timestamps for remote freshness/ordering when local clock validity is uncertain
 - Use minute-based schedule matching (0-1439)
 
 **Error Handling**
@@ -328,22 +416,30 @@ struct StreamPendingAction {
 **Testing**
 - Test WiFi provisioning flow (first boot, saved credentials, reset button)
 - Test schedule evaluation across day boundaries
-- Test occupancy detection with PIR and MLX90614
+- Test occupancy with PIR-only, MLX-only, combined detection, sensor clearing, and the exact 5-minute hold boundary
+- Test that a new direct detection restarts the hold but an already-held value does not
+- Test an occupancy change while Firebase is unavailable, then verify the latest value publishes after recovery and `occupancyPublishPending` clears
+- Verify `/devices/{DEVICE_ID}/occupancy` remains compatible and `status/occupancyDiagnostics` matches the local source flags
 - Test manual override expiry
 - Test forced-off window locking
 - Test energy session tracking across power transitions
 - Test Firebase control stream parsing
+- Test token refresh/network loss for longer than 75s and verify session recovery without erasing WiFi credentials
 
 ---
 
 ## Do NOT
 
 - Hardcode WiFi SSID/password in firmware (use WiFiManager)
+- Print, paste, commit, or document values from `config/secrets.h`
 - Call `wm.resetSettings()` automatically on WiFi failure (only through reset button)
 - Trust client-side AC state (always use `acIrStateTrusted` flag)
 - Block the main loop with WiFi or Firebase calls
 - Poll sensors continuously when outside sensor windows
 - Ignore Firebase control stream errors
+- Mark occupancy as reported before Firebase confirms the write
+- Refresh `lastPresenceDetectedMillis` from `presenceDetected` or another held/derived value
+- Add a second empty-room grace after the unified occupancy hold without explicitly changing the product behavior
 - Skip IR burst repeats (AC units need multiple IR signals)
 - Allow manual overrides to persist indefinitely (always set expiry)
 - Log decision events without cooldown periods
@@ -351,14 +447,29 @@ struct StreamPendingAction {
 
 ---
 
+## Known Constraints and Diagnostic Caveats
+
+- `Firebase-ESP-Client` is deprecated but remains the production dependency. Do not migrate libraries as an incidental fix: the maintained `FirebaseClient` API is asynchronous, requires frequent `FirebaseApp::loop()`, and needs a planned stream/auth/callback rewrite while preserving deferred IR actions and control priority.
+- Firebase RTDB calls in the current library are synchronous. Existing timeouts, the 120-second watchdog, and `markRuntimeOperation()` breadcrumbs reduce risk but do not make the calls asynchronous.
+- Initial setup NTP synchronization still uses repeated default-timeout `getLocalTime()` calls and can delay boot by roughly 115 seconds in the worst case. The watchdog is initialized afterward. Runtime NTP recovery is bounded/non-blocking.
+- WiFiManager `autoConnect()` and the captive portal are intentionally blocking during boot/provisioning. The portal times out after 5 minutes and the ESP restarts; saved credentials are not erased.
+- Status is written with `setJSON`, so optional reset/token/diagnostic fields may disappear on a later heartbeat. Persistent diagnostic-ring entries and previous-reset breadcrumbs are uploaded once and then cleared locally after a successful heartbeat.
+- `bootCount` is RTC-retained across soft/watchdog resets but is lost on complete power loss. `resetReason=1` means a power-on reset and cannot identify the interrupted operation because RTC breadcrumbs may also be lost.
+- Heartbeat freshness proves Firebase communication, not that every local control path was recently executed. Conversely, web “offline” means heartbeat staleness and does not by itself prove that AC schedule control stopped.
+- The current partition is Huge APP with no OTA. Changing the partition scheme can erase or relocate flash data and must be tested separately; do not enable OTA casually on deployed devices.
+
+---
+
 ## AI Agent Behavior
 
 **Before Modifying Code**
-1. Check existing global state in `structures.h`
-2. Search for similar patterns in function modules
-3. Verify Firebase paths in use
-4. Check timing constants in `config.h`
-5. Review control priority order
+1. Inspect `git status` and preserve all pre-existing user changes
+2. Check existing global state in `structures.h` and definitions in `ESP32-Code.ino`
+3. Search for similar patterns and every caller/consumer before changing shared state
+4. Verify Firebase paths and database write semantics in use
+5. Check timing constants in `config.h`, including aliases that intentionally share one duration
+6. Review control priority and deferred stream-action behavior
+7. Treat source code as authoritative if this document and implementation ever disagree; update this document in the same change
 
 **When Adding Features**
 - Add new functions to appropriate `functions/*.h` file
@@ -366,13 +477,15 @@ struct StreamPendingAction {
 - Add new Firebase paths to documentation
 - Add new decision log events
 - Add new configuration constants to `config.h`
+- Preserve existing Firebase paths used by the web app; add diagnostics under `/status` unless a product/API change is explicitly requested
 
 **When Debugging**
 - Check Serial output for decision event logs
 - Verify Firebase control stream parsing
-- Check WiFi and Firebase connection state
-- Verify time sync (NTP)
-- Check occupancy detection logic
+- Distinguish power loss, watchdog/panic, software restart, WiFi loss, Firebase readiness loss, permission failure, and stale heartbeat before assigning a cause
+- Check WiFi, Firebase token/readiness, heartbeat age, reset reason, recovery counters, and persistent breadcrumbs together
+- Verify local and server timestamps before diagnosing time sync
+- For occupancy, compare root `/occupancy`, all `occupancyDiagnostics` source flags, `lastPresenceAgeMs`, and `occupancyPublishPending`
 - Review energy tracking session state
 
 **Architectural Decisions**
@@ -436,7 +549,8 @@ static void queueAcStreamAction(bool power, int temp, const char* source) {
 ## Before Finishing
 
 Always ensure:
-- Code compiles without errors or warnings
+- Firmware changes compile without errors or source warnings using `esp32:esp32:esp32:PartitionScheme=huge_app`; the default partition is too small
+- Record the final flash/RAM utilization. The last verified `occupancy2` build used 1,610,651 bytes flash (51%) and 57,712 bytes global RAM (17%)
 - Serial output includes decision event logs for debugging
 - Firebase paths are correct and documented
 - Timing constants are in `config.h`, not hardcoded
@@ -444,3 +558,5 @@ Always ensure:
 - Function modules remain header-only
 - Non-blocking operations stay non-blocking
 - AC state changes are logged and synced to Firebase
+- Existing web-app Firebase paths and control priority remain compatible
+- No firmware upload, credential erase, partition change, or OTA action occurs unless the user explicitly requests it

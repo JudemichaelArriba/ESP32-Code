@@ -24,12 +24,11 @@ static void markSensorWindowActive() {
 }
 
 bool pushOccupancyToFirebase(bool force) {
-  if (!force && lastPresenceReported == presenceDetected) return true;
-
   const unsigned long now = millis();
   const bool pirRecentMotion = (lastPirMotionMillis != 0) &&
                                ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
-  if (lastPresenceReported != presenceDetected) {
+  static bool lastPresenceLogged = true;
+  if (lastPresenceLogged != presenceDetected) {
     Serial.printf("Occupancy: %s [pir=%d recent=%d mlx=%d obj=%.1f amb=%.1f delta=%.1f]\n",
                   presenceDetected ? "true" : "false",
                   pirMotionDetected,
@@ -38,18 +37,33 @@ bool pushOccupancyToFirebase(bool force) {
                   mlxObjectTemp,
                   mlxAmbientTemp,
                   mlxDeltaTemp);
+    lastPresenceLogged = presenceDetected;
   }
 
-  lastPresenceReported = presenceDetected;
+  if (lastPresenceReported != presenceDetected) {
+    occupancyPublishPending = true;
+  }
+  if (!force && !occupancyPublishPending) return true;
   if (!canWriteSensorDataToFirebase()) return false;
+  if (lastOccupancyPublishAttemptMillis != 0 &&
+      (now - lastOccupancyPublishAttemptMillis) < OCCUPANCY_PUBLISH_RETRY_MS) {
+    return false;
+  }
+
+  const bool occupancyToPublish = presenceDetected;
+  lastOccupancyPublishAttemptMillis = now;
 
   String basePath = "/devices/" + String(DEVICE_ID);
   markRuntimeOperation("firebase_occupancy");
-  bool written = Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
+  bool written = Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", occupancyToPublish);
   clearRuntimeOperation();
-  if (!written) {
-    // Preserve the previous reported value so the next loop retries the change.
-    lastPresenceReported = !presenceDetected;
+  if (written) {
+    // Only a confirmed Firebase write is considered reported. If the local
+    // state ever changes during this operation, leave the new value pending.
+    lastPresenceReported = occupancyToPublish;
+    occupancyPublishPending = (presenceDetected != occupancyToPublish);
+  } else {
+    occupancyPublishPending = true;
   }
   return written;
 }
@@ -106,24 +120,29 @@ static void refreshMlxPresenceIfDue(const unsigned long now) {
 
 static void refreshOccupancyState() {
   const unsigned long now = millis();
+  bool pirMotionEvent = false;
 
   if (pirMotionLatched) {
     pirMotionLatched = false;
     lastPirMotionMillis = now;
+    pirMotionEvent = true;
   }
 
   const bool pirRawActive = PIR_ACTIVE_HIGH ? (digitalRead(PIR_PIN) == HIGH) : (digitalRead(PIR_PIN) == LOW);
   pirMotionDetected = pirRawActive;
   refreshMlxPresenceIfDue(now);
 
-  const bool pirRecentMotion = (lastPirMotionMillis != 0) && ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
-  const bool anyDetected = pirRawActive || pirRecentMotion || mlxPresenceDetected;
+  const bool anyDetectedNow = pirMotionEvent || pirRawActive || mlxPresenceDetected;
 
-  if (anyDetected) {
+  if (anyDetectedNow) {
     lastPresenceDetectedMillis = now;
   }
 
-  presenceDetected = (lastPresenceDetectedMillis != 0) && ((now - lastPresenceDetectedMillis) <= PIR_HOLD_MS);
+  // Hold the combined result once from the latest real sensor detection. The
+  // schedule uses the same duration from lastPresenceDetectedMillis, so this
+  // does not stack another delay before the empty-room shutdown.
+  presenceDetected = (lastPresenceDetectedMillis != 0) &&
+                     ((now - lastPresenceDetectedMillis) <= OCCUPANCY_HOLD_MS);
 }
 
 void refreshOccupancyOnly() {

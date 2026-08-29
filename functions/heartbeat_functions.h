@@ -55,6 +55,36 @@ void tickHeartbeat() {
     json.set("tokenErrorCode", lastFirebaseTokenErrorCode);
   }
   json.set("mlxAvailable", mlxAvailable);
+  const unsigned long heartbeatNow = millis();
+  const bool pirRecentMotion = (lastPirMotionMillis != 0) &&
+                               ((heartbeatNow - lastPirMotionMillis) <= PIR_HOLD_MS);
+  const bool mlxReadingValid = !isnan(mlxObjectTemp) && !isnan(mlxAmbientTemp) &&
+                               !isnan(mlxDeltaTemp);
+  const bool occupancyHoldActive = presenceDetected &&
+                                   !pirMotionDetected &&
+                                   !mlxPresenceDetected;
+  json.set("occupancyDiagnostics/presenceDetected", presenceDetected);
+  json.set("occupancyDiagnostics/occupancyHoldActive", occupancyHoldActive);
+  json.set("occupancyDiagnostics/pirMotionDetected", pirMotionDetected);
+  json.set("occupancyDiagnostics/pirRecentMotion", pirRecentMotion);
+  json.set("occupancyDiagnostics/mlxPresenceDetected", mlxPresenceDetected);
+  json.set("occupancyDiagnostics/mlxReadingValid", mlxReadingValid);
+  if (mlxReadingValid) {
+    json.set("occupancyDiagnostics/mlxObjectTemp", mlxObjectTemp);
+    json.set("occupancyDiagnostics/mlxAmbientTemp", mlxAmbientTemp);
+    json.set("occupancyDiagnostics/mlxDeltaTemp", mlxDeltaTemp);
+  } else {
+    json.set("occupancyDiagnostics/mlxObjectTemp");
+    json.set("occupancyDiagnostics/mlxAmbientTemp");
+    json.set("occupancyDiagnostics/mlxDeltaTemp");
+  }
+  if (lastPresenceDetectedMillis != 0) {
+    json.set("occupancyDiagnostics/lastPresenceAgeMs",
+             (uint32_t)(heartbeatNow - lastPresenceDetectedMillis));
+  } else {
+    json.set("occupancyDiagnostics/lastPresenceAgeMs");
+  }
+  json.set("occupancyDiagnostics/occupancyPublishPending", occupancyPublishPending);
   appendPersistentDiagnosticsToJson(json);
   if (previousResetBreadcrumbAvailable) {
     json.set("previousResetOperation", String(previousResetOperation));

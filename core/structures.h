@@ -122,6 +122,8 @@ extern bool pirMotionDetected;
 extern bool mlxPresenceDetected;
 extern bool presenceDetected;
 extern bool lastPresenceReported;
+extern bool occupancyPublishPending;
+extern unsigned long lastOccupancyPublishAttemptMillis;
 extern uint8_t mlxPositiveReadStreak;
 extern uint8_t mlxNegativeReadStreak;
 

@@ -36,6 +36,8 @@ bool pirMotionDetected    = false;
 bool mlxPresenceDetected  = false;
 bool presenceDetected     = false;
 bool lastPresenceReported = true;
+bool occupancyPublishPending = false;
+unsigned long lastOccupancyPublishAttemptMillis = 0;
 uint8_t mlxPositiveReadStreak = 0;
 uint8_t mlxNegativeReadStreak = 0;
 
@@ -86,8 +88,6 @@ String lastScheduleWindowKey   = "";
 String manualOverrideUntil     = "";
 int    manualOverrideTargetTemp = 24;
 int    estimatedWattsOn        = DEFAULT_ESTIMATED_WATTS_ON;
-
-const unsigned long SCHEDULE_NO_OCC_OFF_MS = 5UL * 60UL * 1000UL;
 
 bool forcedOffActive = false;
 String forcedOffWindowKey = "";
