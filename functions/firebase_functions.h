@@ -3,23 +3,30 @@
 #define FIREBASE_FUNCTIONS_H
 
 #include "../core/structures.h"
+#include "wifi_functions.h"
 #include "utility_functions.h"
+#include "persistence_functions.h"
 #include "logger_functions.h"
 
 void setControlStateToFirebase(bool active);
 bool fetchAssignedRoomFromFirebase();
 void syncAcStateToFirebase();
-void loadAcStateFromFirebase();
+bool loadAcStateFromFirebase();
 void applyControlJson(JsonVariant data);
-void loadControlStateFromFirebase();
+bool loadControlStateFromFirebase();
 void ensureControlStream();
 void pollControlStream();
 void reconnectWiFiNonBlocking();
+void serviceNetworkTime();
+void serviceNetworkRecovery();
 void initFirebaseIfNeeded();
 bool isFirebaseAuthOrSslError(const String& err);
 bool isFirebaseTokenPendingError(const String& err);
 bool isFirebaseRevokedError(const String& err);
 void requestFirebaseReinit(const String& reason);
+void noteFirebaseDataSuccess();
+void noteFirebaseDataFailure(const String& operation, const String& error, int httpCode = 0);
+void noteFirebaseHeartbeatSuccess();
 void clearForcedOffPersistedInFirebase();
 ScheduleStatus evaluateScheduleStatus(const struct tm& t);
 
@@ -31,6 +38,103 @@ static const uint8_t NA_READY       = 4;
 
 // Global timer to debounce our own HTTP writes from the Realtime Stream
 unsigned long lastEspControlWriteMillis = 0;
+
+static uint8_t firebaseDataFailureCount = 0;
+static uint8_t firebaseStreamFailureCount = 0;
+static unsigned long firebaseRetryNotBeforeMillis = 0;
+static unsigned long firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MIN_MS;
+static unsigned long lastForcedWiFiRecoveryMillis = 0;
+static bool tokenDiagnosticPending = false;
+static void setNetAuthState(uint8_t s);
+
+static const char* firebaseTokenStatusName(firebase_auth_token_status status) {
+  switch (status) {
+    case token_status_uninitialized: return "uninitialized";
+    case token_status_on_initialize: return "initializing";
+    case token_status_on_signing: return "signing";
+    case token_status_on_request: return "requesting";
+    case token_status_on_refresh: return "refreshing";
+    case token_status_ready: return "ready";
+    case token_status_error: return "error";
+    default: return "unknown";
+  }
+}
+
+void firebaseTokenStatusCallback(TokenInfo info) {
+  const String status = firebaseTokenStatusName(info.status);
+  const bool statusChanged = lastFirebaseTokenStatus != status;
+  lastFirebaseTokenStatus = status;
+  lastFirebaseTokenErrorCode = info.error.code;
+  lastFirebaseTokenError = info.error.message.c_str();
+
+  if (statusChanged || info.status == token_status_error) {
+    Serial.printf("Firebase token: %s", status.c_str());
+    if (info.status == token_status_error) {
+      Serial.printf(" (code %d: %s)", info.error.code,
+                    info.error.message.c_str());
+      tokenDiagnosticPending = true;
+    }
+    Serial.println();
+  }
+}
+
+static bool deadlineReached(unsigned long now, unsigned long deadline) {
+  return deadline == 0 || (long)(now - deadline) >= 0;
+}
+
+static void noteNetworkOutageStarted() {
+  if (networkOutageSinceMillis == 0) {
+    const unsigned long now = millis();
+    networkOutageSinceMillis = now == 0 ? 1 : now;
+    // Reboot-durable marker: proves the outage window even if a power cycle
+    // discards the RAM-buffered decision logs recorded inside it.
+    recordPersistentDiagnostic("network_outage_start", "firebase or ntp unavailable");
+  }
+}
+
+static unsigned long firebaseRecoveryJitterMs() {
+  if (RECOVERY_JITTER_MAX_MS == 0) return 0;
+  const uint64_t mac = ESP.getEfuseMac();
+  return (unsigned long)(mac % (RECOVERY_JITTER_MAX_MS + 1));
+}
+
+static void clearFirebaseSessionObjects() {
+  if (streamAttached) {
+    Firebase.RTDB.endStream(&streamFbdo);
+  }
+  streamAttached = false;
+  streamFbdo.clear();
+  fbdo.clear();
+  Firebase.reset(&config);
+}
+
+static void forceWiFiReconnectForRecovery(const String& reason) {
+  const unsigned long now = millis();
+  if (lastForcedWiFiRecoveryMillis != 0 &&
+      (now - lastForcedWiFiRecoveryMillis) < NETWORK_RECOVERY_COOLDOWN_MS) {
+    return;
+  }
+
+  lastForcedWiFiRecoveryMillis = now == 0 ? 1 : now;
+  noteNetworkOutageStarted();
+  Serial.println("Network recovery: forcing WiFi reconnect (" + reason + ").");
+  recordPersistentDiagnostic("wifi_recovery", reason);
+  clearFirebaseSessionObjects();
+  firebaseInitialized = false;
+  startupStateLoaded = false;
+  wifiLinkUp = false;
+  setNetAuthState(NA_WAIT_WIFI);
+  WiFi.disconnect(false, false);  // Preserve provisioned credentials.
+  lastWiFiReconnectAttempt = 0;
+}
+
+static void servicePendingTokenDiagnostic() {
+  if (!tokenDiagnosticPending) return;
+  tokenDiagnosticPending = false;
+  recordPersistentDiagnostic(
+      "firebase_token",
+      String(lastFirebaseTokenErrorCode) + ":" + lastFirebaseTokenError);
+}
 
 static void setNetAuthState(uint8_t s) {
   if (netAuthState == s) return;
@@ -121,6 +225,7 @@ static void queueForcedOffTrigger(const String& logPrefix) {
   setForcedOffForCurrentWindow();
   manualOverrideActive = false;
   manualOverrideUntil = "";
+  persistManualOverrideState();
 
   queueAcStreamAction(false, acTempState, "forced_off");
   queueForcedOffPersistence(forcedOffActive, forcedOffWindowKey);
@@ -135,15 +240,17 @@ static bool updateControlPatch(FirebaseJson& patch) {
   String base = "/devices/" + String(DEVICE_ID) + "/control";
   lastEspControlWriteMillis = millis();
 
-  if (Firebase.RTDB.updateNode(&fbdo, base, &patch)) {
+  markRuntimeOperation("firebase_control_patch");
+  bool updated = Firebase.RTDB.updateNode(&fbdo, base, &patch);
+  clearRuntimeOperation();
+  if (updated) {
+    noteFirebaseDataSuccess();
     return true;
   }
 
   String err = fbdo.errorReason();
   Serial.println("Control patch failed: " + err);
-  if (!isFirebaseTokenPendingError(err) && isFirebaseAuthOrSslError(err)) {
-    requestFirebaseReinit(err);
-  }
+  noteFirebaseDataFailure("control_patch", err, fbdo.httpCode());
   return false;
 }
 
@@ -158,32 +265,113 @@ bool isFirebaseRevokedError(const String& err) {
 
 // Catch a broader range of network/SSL failures so the client actually resets
 bool isFirebaseAuthOrSslError(const String& err) {
-  return isFirebaseRevokedError(err) ||
-         err.indexOf("ssl") >= 0 ||
-         err.indexOf("SSL") >= 0 ||
-         err.indexOf("not connected") >= 0 ||
-         err.indexOf("connection") >= 0 ||
-         err.indexOf("TCP") >= 0 ||
-         err.indexOf("closed") >= 0;
+  String normalized = err;
+  normalized.toLowerCase();
+  return isFirebaseRevokedError(normalized) ||
+         normalized.indexOf("ssl") >= 0 ||
+         normalized.indexOf("handshake") >= 0 ||
+         normalized.indexOf("not connected") >= 0 ||
+         normalized.indexOf("connection") >= 0 ||
+         normalized.indexOf("tcp") >= 0 ||
+         normalized.indexOf("closed") >= 0 ||
+         normalized.indexOf("timeout") >= 0 ||
+         normalized.indexOf("timed out") >= 0 ||
+         normalized.indexOf("unauthorized") >= 0 ||
+         normalized.indexOf("permission denied") >= 0;
+}
+
+static bool isFirebaseCredentialError(const String& err, int httpCode) {
+  String normalized = err;
+  normalized.toLowerCase();
+  return httpCode == 401 || httpCode == 403 ||
+         isFirebaseRevokedError(normalized) ||
+         normalized.indexOf("unauthorized") >= 0 ||
+         normalized.indexOf("permission denied") >= 0;
 }
 
 void requestFirebaseReinit(const String& reason) {
   unsigned long now = millis();
-  if ((now - lastStreamRetryMillis) < 10000) return;
+  if (!firebaseInitialized && netAuthState == NA_WAIT_STABLE &&
+      !deadlineReached(now, firebaseRetryNotBeforeMillis)) return;
 
-  lastStreamRetryMillis = now;
+  firebaseRecoveryCount++;
+  if (firebaseSessionRecoveryStreak < 255) firebaseSessionRecoveryStreak++;
+  noteNetworkOutageStarted();
   Serial.println("Firebase reinit requested: " + reason);
-  streamAttached      = false;
+  recordPersistentDiagnostic("firebase_reinit", reason);
+  clearFirebaseSessionObjects();
   firebaseInitialized = false;
   startupStateLoaded  = false;
-  Firebase.RTDB.endStream(&streamFbdo);
+  firebaseUnavailableSinceMillis = 0;
+  lastStreamRetryMillis = now;
+  lastWiFiConnectedMillis = now;
+  firebaseRetryNotBeforeMillis =
+      now + firebaseReinitBackoffMillis + firebaseRecoveryJitterMs();
+  if (firebaseReinitBackoffMillis < FIREBASE_REINIT_BACKOFF_MAX_MS) {
+    firebaseReinitBackoffMillis *= 2;
+    if (firebaseReinitBackoffMillis > FIREBASE_REINIT_BACKOFF_MAX_MS) {
+      firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MAX_MS;
+    }
+  }
   setNetAuthState(NA_WAIT_STABLE);
+
+  if (firebaseSessionRecoveryStreak >=
+      FIREBASE_RECOVERIES_BEFORE_WIFI_RECOVERY) {
+    forceWiFiReconnectForRecovery("repeated Firebase recovery failures");
+  }
+}
+
+void noteFirebaseDataSuccess() {
+  firebaseDataFailureCount = 0;
+}
+
+void noteFirebaseDataFailure(const String& operation, const String& error, int httpCode) {
+  if (isFirebaseTokenPendingError(error)) return;
+  noteNetworkOutageStarted();
+  if (firebaseDataFailureCount < 255) firebaseDataFailureCount++;
+
+  Serial.printf("Firebase %s failure %u/%u (HTTP %d): %s\n",
+                operation.c_str(), firebaseDataFailureCount,
+                FIREBASE_FAILURES_BEFORE_REINIT, httpCode, error.c_str());
+
+  const bool fatal = isFirebaseCredentialError(error, httpCode);
+  if (fatal || firebaseDataFailureCount >= FIREBASE_FAILURES_BEFORE_REINIT) {
+    requestFirebaseReinit(operation + ": " + error);
+  }
+}
+
+static void noteFirebaseStreamFailure(const String& operation,
+                                      const String& error,
+                                      int httpCode) {
+  if (isFirebaseTokenPendingError(error)) return;
+  noteNetworkOutageStarted();
+
+  streamAttached = false;
+  Firebase.RTDB.endStream(&streamFbdo);
+  lastStreamRetryMillis = millis();
+  if (firebaseStreamFailureCount < 255) firebaseStreamFailureCount++;
+
+  Serial.printf("Firebase %s failure %u/%u (HTTP %d): %s\n",
+                operation.c_str(), firebaseStreamFailureCount,
+                FIREBASE_FAILURES_BEFORE_REINIT, httpCode, error.c_str());
+
+  if (isFirebaseCredentialError(error, httpCode) ||
+      firebaseStreamFailureCount >= FIREBASE_FAILURES_BEFORE_REINIT) {
+    requestFirebaseReinit(operation + ": " + error);
+  }
 }
 
 void setControlStateToFirebase(bool active) {
   String controlPath = "/devices/" + String(DEVICE_ID) + "/control/overrideActive";
   lastEspControlWriteMillis = millis();
-  Firebase.RTDB.setBool(&fbdo, controlPath, active);
+  markRuntimeOperation("firebase_control_write");
+  bool written = Firebase.RTDB.setBool(&fbdo, controlPath, active);
+  clearRuntimeOperation();
+  if (written) {
+    noteFirebaseDataSuccess();
+  } else {
+    noteFirebaseDataFailure("control_write", fbdo.errorReason(), fbdo.httpCode());
+  }
 }
 
 void clearForcedOffPersistedInFirebase() {
@@ -211,13 +399,16 @@ bool fetchAssignedRoomFromFirebase() {
   if ((now - lastRoomsFetchAttemptMillis) < ROOMS_FETCH_RETRY_MS)    return false;
   lastRoomsFetchAttemptMillis = now;
 
-  if (!Firebase.RTDB.getJSON(&fbdo, "/rooms")) {
+  markRuntimeOperation("firebase_rooms_read");
+  bool roomsRead = Firebase.RTDB.getJSON(&fbdo, "/rooms");
+  clearRuntimeOperation();
+  if (!roomsRead) {
     String err = fbdo.errorReason();
     Serial.println("Failed to read /rooms: " + err);
-    if (isFirebaseTokenPendingError(err)) return false;
-    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
+    noteFirebaseDataFailure("rooms_read", err, fbdo.httpCode());
     return false;
   }
+  noteFirebaseDataSuccess();
 
   DynamicJsonDocument doc(16384);
   if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) {
@@ -276,29 +467,60 @@ void syncAcStateToFirebase() {
     json.set("roomUid", assignedRoom.uid);
   }
 
-  if (!Firebase.RTDB.setJSON(&fbdo, basePath, &json)) {
-    Serial.println("Failed to sync acState: " + fbdo.errorReason());
+  markRuntimeOperation("firebase_ac_write");
+  bool written = Firebase.RTDB.setJSON(&fbdo, basePath, &json);
+  clearRuntimeOperation();
+  if (!written) {
+    String err = fbdo.errorReason();
+    Serial.println("Failed to sync acState: " + err);
+    noteFirebaseDataFailure("ac_state_write", err, fbdo.httpCode());
+  } else {
+    noteFirebaseDataSuccess();
   }
 }
 
-void loadAcStateFromFirebase() {
+bool loadAcStateFromFirebase() {
   String path = "/devices/" + String(DEVICE_ID) + "/acState";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) return;
+  markRuntimeOperation("firebase_ac_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
+    String err = fbdo.errorReason();
+    Serial.println("Failed to load acState: " + err);
+    noteFirebaseDataFailure("ac_state_read", err, fbdo.httpCode());
+    return false;
+  }
 
   DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
+  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) {
+    Serial.println("Failed to parse acState JSON.");
+    return false;
+  }
 
   if (!doc["power"].isNull())       acPowerState = doc["power"].as<bool>();
   if (!doc["currentTemp"].isNull()) acTempState  = normalizeACTemp((float)doc["currentTemp"].as<int>());
   acIrStateTrusted = false;
+  noteFirebaseDataSuccess();
+  return true;
 }
 
-void loadControlStateFromFirebase() {
+bool loadControlStateFromFirebase() {
   String path = "/devices/" + String(DEVICE_ID) + "/control";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) return;
+  markRuntimeOperation("firebase_control_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
+    String err = fbdo.errorReason();
+    Serial.println("Failed to load control state: " + err);
+    noteFirebaseDataFailure("control_state_read", err, fbdo.httpCode());
+    return false;
+  }
 
   DynamicJsonDocument doc(512);
-  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) return;
+  if (deserializeJson(doc, fbdo.jsonString()) != DeserializationError::Ok) {
+    Serial.println("Failed to parse control state JSON.");
+    return false;
+  }
   JsonVariant control = doc.as<JsonVariant>();
 
   loadAiAutoApplyFromControl(control, "startup_load", true);
@@ -319,6 +541,7 @@ void loadControlStateFromFirebase() {
     manualOverrideUntil = "";
 
   manualOverridePower = resolveManualOverridePower(control, manualOverrideActive);
+  manualOverrideTemp = manualOverrideTargetTemp;
 
   String persistedWindowKey = "";
   if (!control["forcedOffWindowKey"].isNull()) {
@@ -335,6 +558,7 @@ void loadControlStateFromFirebase() {
     setForcedOffForCurrentWindow();
     manualOverrideActive = false;
     manualOverrideUntil = "";
+    persistManualOverrideState();
 
     FirebaseJson patch;
     patch.set("forcedOffPersisted", forcedOffActive);
@@ -346,7 +570,8 @@ void loadControlStateFromFirebase() {
     logDecisionEvent("forced_off_trigger", "forced_off", false, acTempState,
                      -1, aiAutoApplyEnabled, true,
                      forcedOffActive ? "startup_window_locked" : "startup_no_active_window");
-    return;
+    noteFirebaseDataSuccess();
+    return true;
   }
 
   if (hasForcedOffPersisted) {
@@ -363,12 +588,17 @@ void loadControlStateFromFirebase() {
       clearForcedOffPersistedInFirebase();
       Serial.println("Startup: stale forcedOff persistence cleared.");
     }
-    return;
+    persistManualOverrideState();
+    noteFirebaseDataSuccess();
+    return true;
   }
 
   if (persistedWindowKey.length() > 0) {
     clearForcedOffPersistedInFirebase();
   }
+  persistManualOverrideState();
+  noteFirebaseDataSuccess();
+  return true;
 }
 
 static void handleControlJsonSnapshot(const String& payload) {
@@ -399,6 +629,7 @@ static void handleControlJsonSnapshot(const String& payload) {
     manualOverrideUntil = v["overrideUntil"].as<String>();
 
   manualOverridePower = resolveManualOverridePower(v, manualOverrideActive);
+  manualOverrideTemp = manualOverrideTargetTemp;
 
   if (manualOverrideActive) {
     if (forcedOffActive) {
@@ -421,16 +652,11 @@ static void handleControlJsonSnapshot(const String& payload) {
     logDecisionEvent("manual_override", "manual", false, acTempState,
                      -1, aiAutoApplyEnabled, false, "stream_json_off");
   }
+  persistManualOverrideState();
 }
 
 static void handleControlStreamEvent(const String& path, const String& type) {
   Serial.println("Stream update: " + path + " [" + type + "]");
-
-  if (lastEspControlWriteMillis > 0 &&
-      (millis() - lastEspControlWriteMillis) < 4000) {
-    Serial.println("Stream: Ignoring echo from ESP's own write.");
-    return;
-  }
 
   streamPendingAction = StreamPendingAction();
 
@@ -477,12 +703,14 @@ static void handleControlStreamEvent(const String& path, const String& type) {
                        -1, aiAutoApplyEnabled, false, "stream_off");
 
     }
+    persistManualOverrideState();
     return;
   }
 
   if ((path == "/targetTemp" || path == "/temp") &&
       (type == "int" || type == "float" || type == "double")) {
     manualOverrideTargetTemp = normalizeACTemp((float)streamFbdo.floatData());
+    manualOverrideTemp = manualOverrideTargetTemp;
     if (manualOverrideActive) {
       if (!manualOverridePower) manualOverridePower = true;
       queueAcStreamAction(manualOverridePower, manualOverrideTargetTemp, "manual");
@@ -490,11 +718,13 @@ static void handleControlStreamEvent(const String& path, const String& type) {
                        manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
                        true, "stream_temp_changed");
     }
+    persistManualOverrideState();
     return;
   }
 
   if (path == "/overrideUntil" && type == "string") {
     manualOverrideUntil = streamFbdo.stringData();
+    persistManualOverrideState();
     return;
   }
 
@@ -506,6 +736,7 @@ static void handleControlStreamEvent(const String& path, const String& type) {
                        manualOverrideTargetTemp, -1, aiAutoApplyEnabled,
                        true, "stream_power_changed");
     }
+    persistManualOverrideState();
     return;
   }
 }
@@ -516,16 +747,17 @@ void ensureControlStream() {
   if (streamAttached) return;
 
   unsigned long now = millis();
-  if ((now - lastStreamRetryMillis)  < 5000)                  return;
+  if ((now - lastStreamRetryMillis) < FIREBASE_STREAM_RETRY_MS) return;
   if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
 
   String streamPath = "/devices/" + String(DEVICE_ID) + "/control";
-  if (!Firebase.RTDB.beginStream(&streamFbdo, streamPath)) {
+  markRuntimeOperation("firebase_stream_begin");
+  bool began = Firebase.RTDB.beginStream(&streamFbdo, streamPath);
+  clearRuntimeOperation();
+  if (!began) {
     String err = streamFbdo.errorReason();
     Serial.println("Control stream begin failed: " + err);
-    lastStreamRetryMillis = now;
-    if (isFirebaseTokenPendingError(err)) return;
-    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
+    noteFirebaseStreamFailure("stream_begin", err, streamFbdo.httpCode());
     return;
   }
 
@@ -536,23 +768,28 @@ void pollControlStream() {
   if (!streamAttached || !firebaseInitialized || WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   if (netAuthState != NA_READY) return;
 
-  if (!Firebase.RTDB.readStream(&streamFbdo)) {
+  markRuntimeOperation("firebase_stream_read");
+  bool streamRead = Firebase.RTDB.readStream(&streamFbdo);
+  clearRuntimeOperation();
+  if (!streamRead) {
     String err = streamFbdo.errorReason();
     if (err.length() > 0) {
       Serial.println("Control stream read failed: " + err);
     }
     if (isFirebaseTokenPendingError(err)) return;
-    if (isFirebaseAuthOrSslError(err)) requestFirebaseReinit(err);
+
+    noteFirebaseStreamFailure("stream_read", err, streamFbdo.httpCode());
     return;
   }
+
+  firebaseStreamFailureCount = 0;
 
   if (streamFbdo.streamTimeout()) {
     Serial.println("Firebase stream timeout, auto-resuming...");
     if (!streamFbdo.httpConnected()) {
       String err = streamFbdo.errorReason();
-      if (!isFirebaseTokenPendingError(err) && isFirebaseAuthOrSslError(err)) {
-        requestFirebaseReinit(err);
-      }
+      noteFirebaseStreamFailure("stream_timeout", err, streamFbdo.httpCode());
+      return;
     }
   }
 
@@ -565,6 +802,8 @@ void reconnectWiFiNonBlocking() {
   wl_status_t status = WiFi.status();
 
   if (status == WL_CONNECTED) {
+    resetWiFiReconnectFailures();
+
     if (!wifiLinkUp) {
       wifiLinkUp              = true;
       lastWiFiConnectedMillis = millis();
@@ -572,31 +811,20 @@ void reconnectWiFiNonBlocking() {
       startupStateLoaded      = false;
       firebaseInitialized     = false;
       setNetAuthState(NA_WAIT_STABLE);
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+      lastNtpSyncMillis = millis();
 
-      if (!wifiHasConnectedOnce) {
-        wifiHasConnectedOnce = true;
-      } else {
-        wifiReconnectRestartPending = true;
-        wifiReconnectStableSince    = millis();
-        Serial.println("WiFi restored, waiting stable then restarting...");
+      const bool restoredConnection = wifiHasConnectedOnce;
+      wifiHasConnectedOnce = true;
+      if (restoredConnection) {
+        Serial.println("WiFi restored; rebuilding Firebase session without rebooting.");
       }
-    }
-
-    if (wifiReconnectRestartPending &&
-        (millis() - wifiReconnectStableSince) >= WIFI_RECONNECT_RESTART_STABLE_MS) {
-      Serial.println("WiFi stable after reconnect, restarting ESP...");
-      delay(100);
-      ESP.restart();
     }
     return;
   }
 
-  if (wifiLinkUp) wifiReconnectRestartPending = false;
-
   wifiLinkUp = false;
   setNetAuthState(NA_WAIT_WIFI);
-
-  if (status == WL_IDLE_STATUS) return;
 
   unsigned long now = millis();
   if (now - lastWiFiReconnectAttempt < WIFI_RECONNECT_MS) return;
@@ -607,16 +835,95 @@ void reconnectWiFiNonBlocking() {
   startupStateLoaded       = false;
   Serial.println("WiFi disconnected, reconnecting...");
   WiFi.reconnect();
+  noteWiFiReconnectFailure();
+}
+
+void serviceNetworkTime() {
+  servicePendingTokenDiagnostic();
+  if (WiFi.status() != WL_CONNECTED) {
+    // A lost network does not invalidate an already-synchronized local clock.
+    return;
+  }
+
+  const unsigned long now = millis();
+  if (lastNtpCheckMillis != 0 &&
+      (now - lastNtpCheckMillis) < NTP_VALID_CHECK_MS) {
+    return;
+  }
+  lastNtpCheckMillis = now;
+
+  struct tm currentTime;
+  if (timeIsValid(currentTime)) {
+    if (!ntpTimeValid) Serial.println("NTP: system time is valid.");
+    ntpTimeValid = true;
+    consecutiveNtpFailures = 0;
+    lastNtpValidMillis = now;
+
+    if (lastNtpSyncMillis == 0 ||
+        (now - lastNtpSyncMillis) >= NTP_RECONFIG_INTERVAL_MS) {
+      configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+      lastNtpSyncMillis = now;
+      Serial.println("NTP: periodic resync requested.");
+    }
+    return;
+  }
+
+  ntpTimeValid = false;
+  noteNetworkOutageStarted();
+  if (lastNtpSyncMillis != 0 &&
+      (now - lastNtpSyncMillis) < NTP_RETRY_MS) {
+    return;
+  }
+
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  lastNtpSyncMillis = now;
+  if (consecutiveNtpFailures < 255) consecutiveNtpFailures++;
+  Serial.printf("NTP: time unavailable, retry %u/%u.\n",
+                consecutiveNtpFailures,
+                NTP_FAILURES_BEFORE_WIFI_RECOVERY);
+
+  if (consecutiveNtpFailures == NTP_FAILURES_BEFORE_WIFI_RECOVERY) {
+    recordPersistentDiagnostic("ntp_unavailable", "time synchronization failed");
+  }
+  if (consecutiveNtpFailures >= NTP_FAILURES_BEFORE_WIFI_RECOVERY) {
+    forceWiFiReconnectForRecovery("NTP unavailable");
+    consecutiveNtpFailures = 0;
+  }
+}
+
+void serviceNetworkRecovery() {
+  servicePendingTokenDiagnostic();
+  if (networkOutageSinceMillis == 0) return;
+
+  const unsigned long now = millis();
+  if ((now - networkOutageSinceMillis) < NETWORK_OUTAGE_RESTART_MS) return;
+
+  Serial.println("Network recovery: outage limit reached, restarting ESP safely.");
+  persistManualOverrideState();
+  recordPersistentDiagnostic("network_restart", "outage limit reached");
+  delay(100);
+  ESP.restart();
+}
+
+void noteFirebaseHeartbeatSuccess() {
+  lastHeartbeatSuccessMillis = millis();
+  consecutiveHeartbeatFailures = 0;
+  networkOutageSinceMillis = 0;
+  firebaseSessionRecoveryStreak = 0;
 }
 
 void initFirebaseIfNeeded() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (!wifiLinkUp) return;
 
-  struct tm t;
-  if (!timeIsValid(t)) return;
+  // serviceNetworkTime() performs the bounded 30-second validity check. Avoid
+  // calling getLocalTime() on every loop while a boot-time NTP request is down.
+  if (!ntpTimeValid) return;
 
   unsigned long now = millis();
+
+  if (!deadlineReached(now, firebaseRetryNotBeforeMillis)) return;
+  firebaseRetryNotBeforeMillis = 0;
 
   if (netAuthState == NA_WAIT_STABLE) {
     if ((now - lastWiFiConnectedMillis) < WIFI_STABLE_BEFORE_FB_MS) return;
@@ -627,10 +934,17 @@ void initFirebaseIfNeeded() {
     // Bump BSSL buffer slightly to give the SSL engine more breathing room
     fbdo.setBSSLBufferSize(8192, 2048);
     streamFbdo.setBSSLBufferSize(8192, 2048);
-    config.timeout.socketConnection = 10000;
+    config.timeout.socketConnection = FIREBASE_SOCKET_TIMEOUT_MS;
+    config.timeout.sslHandshake = FIREBASE_SSL_HANDSHAKE_TIMEOUT_MS;
+    config.timeout.serverResponse = FIREBASE_SERVER_RESPONSE_TIMEOUT_MS;
+    config.timeout.rtdbKeepAlive = FIREBASE_STREAM_KEEPALIVE_MS;
+    config.timeout.rtdbStreamReconnect = FIREBASE_STREAM_RECONNECT_MS;
+    config.timeout.rtdbStreamError = FIREBASE_STREAM_ERROR_MS;
 
+    markRuntimeOperation("firebase_auth");
     Firebase.begin(&config, &auth);
     Firebase.reconnectNetwork(true);
+    clearRuntimeOperation();
     firebaseInitialized    = true;
     streamAttached         = false;
     startupStateLoaded     = false;
@@ -641,22 +955,64 @@ void initFirebaseIfNeeded() {
   }
 
   if (netAuthState == NA_AUTH_WAIT) {
-    if (!Firebase.ready()) return;
+    if (!Firebase.ready()) {
+      if ((now - netAuthStateSince) >= FIREBASE_AUTH_TIMEOUT_MS) {
+        requestFirebaseReinit("authentication timeout");
+      }
+      return;
+    }
     if ((now - lastFirebaseInitMillis) < FIREBASE_AUTH_SETTLE_MS) return;
     setNetAuthState(NA_READY);
+    lastFirebaseReadyMillis = now;
+    firebaseUnavailableSinceMillis = 0;
+    firebaseDataFailureCount = 0;
+    firebaseStreamFailureCount = 0;
+    firebaseReinitBackoffMillis = FIREBASE_REINIT_BACKOFF_MIN_MS;
     logDecisionEvent("firebase_ready", "network", acPowerState, acTempState,
                      -1, aiAutoApplyEnabled, false, "auth_ready");
     return;
   }
+
+  if (netAuthState == NA_READY) {
+    if (Firebase.ready()) {
+      lastFirebaseReadyMillis = now;
+      if (firebaseUnavailableSinceMillis != 0) {
+        Serial.println("Firebase readiness recovered before timeout.");
+      }
+      firebaseUnavailableSinceMillis = 0;
+      return;
+    }
+
+    noteNetworkOutageStarted();
+    if (firebaseUnavailableSinceMillis == 0) {
+      firebaseUnavailableSinceMillis = now == 0 ? 1 : now;
+      Serial.println("Firebase unavailable; supervising token/session recovery.");
+      recordPersistentDiagnostic("firebase_unavailable", lastFirebaseTokenStatus);
+      return;
+    }
+
+    if ((now - firebaseUnavailableSinceMillis) >=
+        FIREBASE_READY_LOSS_TIMEOUT_MS) {
+      requestFirebaseReinit("ready state unavailable beyond timeout");
+    }
+  }
 }
 
 void clearOverrideInFirebase() {
+  if (WiFi.status() != WL_CONNECTED || !Firebase.ready()) return;
   String base = "/devices/" + String(DEVICE_ID) + "/control";
   lastEspControlWriteMillis = millis();
-  Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
+  markRuntimeOperation("firebase_override_clear");
+  bool controlCleared = Firebase.RTDB.setBool(&fbdo, base + "/overrideActive", false);
 
   String acBase = "/devices/" + String(DEVICE_ID) + "/acState";
-  Firebase.RTDB.setString(&fbdo, acBase + "/source", "override_expired");
+  bool sourceWritten = Firebase.RTDB.setString(&fbdo, acBase + "/source", "override_expired");
+  clearRuntimeOperation();
+  if (!controlCleared || !sourceWritten) {
+    noteFirebaseDataFailure("override_clear", fbdo.errorReason(), fbdo.httpCode());
+  } else {
+    noteFirebaseDataSuccess();
+  }
 }
 
 #endif

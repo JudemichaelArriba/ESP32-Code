@@ -4,6 +4,7 @@
 
 #include "../core/structures.h"
 #include "utility_functions.h"
+#include "persistence_functions.h"
 
 void loadEnergyProfileFromFirebase();
 void syncEnergyProfileToFirebase();
@@ -47,7 +48,10 @@ static bool loadEnergyDailyCache(const String& dateKey) {
   }
 
   String path = energyBasePath() + "/energyDaily/" + dateKey;
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) {
+  markRuntimeOperation("firebase_energy_daily_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
     return true;
   }
 
@@ -84,7 +88,10 @@ static bool syncEnergyDailyCache() {
   json.set("updatedAt", nowIsoString());
 
   String path = energyBasePath() + "/energyDaily/" + energyDailyCache.dateKey;
-  return Firebase.RTDB.setJSON(&fbdo, path, &json);
+  markRuntimeOperation("firebase_energy_daily_write");
+  bool written = Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
+  return written;
 }
 
 static bool syncEnergyStateToFirebase() {
@@ -102,7 +109,10 @@ static bool syncEnergyStateToFirebase() {
   json.set("updatedAt", nowIsoString());
 
   String path = energyBasePath() + "/energyState";
-  return Firebase.RTDB.setJSON(&fbdo, path, &json);
+  markRuntimeOperation("firebase_energy_state_write");
+  bool written = Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
+  return written;
 }
 
 static void startEnergySession(const String& source) {
@@ -145,7 +155,65 @@ static void closeEnergySession(const String& source) {
   energyRuntimeState.sessionStartedAt = "";
   energyRuntimeState.lastSource = source;
 
-  syncEnergyStateToFirebase();
+  // Checkpoint unless the close is confirmed remotely. Testing reachability
+  // instead would skip the checkpoint whenever the write failed while Firebase
+  // merely looked available, leaving the session close unprotected.
+  if (!syncEnergyStateToFirebase()) {
+    persistEnergyCheckpoint();
+  }
+}
+
+// Merges a checkpoint written before a reboot back into today's totals. Totals
+// are absolute, so taking the larger value is idempotent and cannot double
+// count a span that already reached Firebase.
+static void restoreEnergyCheckpointIfNeeded(const String& todayKey) {
+  static bool energyCheckpointRestoreAttempted = false;
+  if (energyCheckpointRestoreAttempted) return;
+  energyCheckpointRestoreAttempted = true;
+
+  EnergyCheckpoint checkpoint;
+  if (!loadEnergyCheckpoint(checkpoint)) return;
+
+  if (todayKey != String(checkpoint.dateKey)) {
+    // A checkpoint from an earlier day is not merged: writing it into the wrong
+    // daily bucket would be worse than the small under-count it represents.
+    Serial.println("Energy checkpoint: stale date, discarded.");
+    recordPersistentDiagnostic("energy_ckpt_stale", String(checkpoint.dateKey));
+    clearEnergyCheckpoint();
+    return;
+  }
+
+  if (checkpoint.runtimeSeconds > energyDailyCache.runtimeSeconds) {
+    energyDailyCache.runtimeSeconds = checkpoint.runtimeSeconds;
+  }
+  if (checkpoint.sessionCount > energyDailyCache.sessionCount) {
+    energyDailyCache.sessionCount = checkpoint.sessionCount;
+  }
+  energyDailyCache.estimatedKwh = computeEstimatedKwh(energyDailyCache.runtimeSeconds);
+
+  // The remote lastFlushAt is stale by exactly the span the checkpoint already
+  // accounted for. Adopting the newer marker prevents replaying that span.
+  time_t checkpointFlushEpoch;
+  if (parseLocalIsoStringToEpoch(String(checkpoint.lastFlushAt), checkpointFlushEpoch)) {
+    time_t loadedFlushEpoch;
+    if (!parseLocalIsoStringToEpoch(energyRuntimeState.lastFlushAt, loadedFlushEpoch) ||
+        checkpointFlushEpoch > loadedFlushEpoch) {
+      energyRuntimeState.lastFlushAt = String(checkpoint.lastFlushAt);
+    }
+  }
+  if (energyRuntimeState.sessionStartedAt.length() == 0 &&
+      checkpoint.sessionStartedAt[0] != '\0') {
+    energyRuntimeState.sessionStartedAt = String(checkpoint.sessionStartedAt);
+  }
+
+  Serial.printf("Energy checkpoint: recovered %lu runtime seconds for %s.\n",
+                energyDailyCache.runtimeSeconds, checkpoint.dateKey);
+  recordPersistentDiagnostic("energy_ckpt_restored",
+                             String(checkpoint.runtimeSeconds) + "s");
+
+  if (syncEnergyDailyCache()) {
+    clearEnergyCheckpoint();
+  }
 }
 
 static void flushEnergyRuntime(bool force) {
@@ -171,6 +239,11 @@ static void flushEnergyRuntime(bool force) {
   if (!force && elapsedSeconds < ENERGY_FLUSH_INTERVAL_SEC) {
     return;
   }
+
+  // Only a confirmed write may retire the checkpoint. Firebase.ready() reports
+  // token lifecycle state, not whether a write will land: after a session
+  // rebuild it reads true while the token is still stale and every write fails.
+  bool writesConfirmed = true;
 
   time_t cursorEpoch = lastFlushEpoch;
   while (cursorEpoch < nowEpoch) {
@@ -205,7 +278,7 @@ static void flushEnergyRuntime(bool force) {
 
     energyDailyCache.runtimeSeconds += segmentSeconds;
     energyDailyCache.estimatedKwh = computeEstimatedKwh(energyDailyCache.runtimeSeconds);
-    syncEnergyDailyCache();
+    if (!syncEnergyDailyCache()) writesConfirmed = false;
 
     cursorEpoch = segmentEndEpoch;
   }
@@ -215,7 +288,18 @@ static void flushEnergyRuntime(bool force) {
   if (assignedRoom.found) {
     energyRuntimeState.roomUid = assignedRoom.uid;
   }
-  syncEnergyStateToFirebase();
+  if (!syncEnergyStateToFirebase()) writesConfirmed = false;
+
+  // Runtime accrues locally whether or not the write lands. The checkpoint may
+  // only be retired once both halves are confirmed: the daily totals in
+  // /energyDaily and the lastFlushAt marker in /energyState. An unreachable
+  // Firebase already returns false from both helpers, so the offline path is
+  // unchanged; this also covers reachable-but-failed writes.
+  if (writesConfirmed) {
+    clearEnergyCheckpoint();
+  } else {
+    persistEnergyCheckpoint();
+  }
 }
 
 void loadEnergyProfileFromFirebase() {
@@ -226,7 +310,10 @@ void loadEnergyProfileFromFirebase() {
   }
 
   String path = energyBasePath() + "/energyProfile";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) {
+  markRuntimeOperation("firebase_energy_profile_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
     return;
   }
 
@@ -254,7 +341,9 @@ void syncEnergyProfileToFirebase() {
   json.set("updatedAt", nowIsoString());
 
   String path = energyBasePath() + "/energyProfile";
+  markRuntimeOperation("firebase_energy_profile_write");
   Firebase.RTDB.setJSON(&fbdo, path, &json);
+  clearRuntimeOperation();
 }
 
 void loadEnergyStateFromFirebase() {
@@ -265,7 +354,10 @@ void loadEnergyStateFromFirebase() {
   }
 
   String path = energyBasePath() + "/energyState";
-  if (!Firebase.RTDB.getJSON(&fbdo, path)) {
+  markRuntimeOperation("firebase_energy_state_read");
+  bool read = Firebase.RTDB.getJSON(&fbdo, path);
+  clearRuntimeOperation();
+  if (!read) {
     return;
   }
 
@@ -298,7 +390,10 @@ void initializeEnergyTrackingForCurrentState() {
   struct tm nowTm;
   bool hasValidTime = timeIsValid(nowTm);
   if (hasValidTime) {
-    loadEnergyDailyCache(dateKeyFromTm(nowTm));
+    const String todayKey = dateKeyFromTm(nowTm);
+    loadEnergyDailyCache(todayKey);
+    // Only with verified time: an unvalidated clock must not merge stored totals.
+    restoreEnergyCheckpointIfNeeded(todayKey);
   }
 
   if (acPowerState) {

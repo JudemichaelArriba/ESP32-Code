@@ -3,12 +3,14 @@
 #define SENSOR_FUNCTIONS_H
 
 #include "../core/structures.h"
+#include "persistence_functions.h"
 
 void pushOccupancyIfChanged();
 bool pushOccupancyToFirebase(bool force);
 void refreshOccupancyOnly();
 void refreshSensorsAndOccupancy();
 void disableSensorsAndOccupancyIfIdle();
+void tickOccupancySerialDiagnostics();
 bool forceReadDhtNow();
 bool callRenderMLAndGetTarget(int& targetTempOut);
 
@@ -23,12 +25,11 @@ static void markSensorWindowActive() {
 }
 
 bool pushOccupancyToFirebase(bool force) {
-  if (!force && lastPresenceReported == presenceDetected) return true;
-
   const unsigned long now = millis();
   const bool pirRecentMotion = (lastPirMotionMillis != 0) &&
                                ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
-  if (lastPresenceReported != presenceDetected) {
+  static bool lastPresenceLogged = true;
+  if (lastPresenceLogged != presenceDetected) {
     Serial.printf("Occupancy: %s [pir=%d recent=%d mlx=%d obj=%.1f amb=%.1f delta=%.1f]\n",
                   presenceDetected ? "true" : "false",
                   pirMotionDetected,
@@ -37,13 +38,35 @@ bool pushOccupancyToFirebase(bool force) {
                   mlxObjectTemp,
                   mlxAmbientTemp,
                   mlxDeltaTemp);
+    lastPresenceLogged = presenceDetected;
   }
 
-  lastPresenceReported = presenceDetected;
+  if (lastPresenceReported != presenceDetected) {
+    occupancyPublishPending = true;
+  }
+  if (!force && !occupancyPublishPending) return true;
   if (!canWriteSensorDataToFirebase()) return false;
+  if (lastOccupancyPublishAttemptMillis != 0 &&
+      (now - lastOccupancyPublishAttemptMillis) < OCCUPANCY_PUBLISH_RETRY_MS) {
+    return false;
+  }
+
+  const bool occupancyToPublish = presenceDetected;
+  lastOccupancyPublishAttemptMillis = now;
 
   String basePath = "/devices/" + String(DEVICE_ID);
-  return Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", presenceDetected);
+  markRuntimeOperation("firebase_occupancy");
+  bool written = Firebase.RTDB.setBool(&fbdo, basePath + "/occupancy", occupancyToPublish);
+  clearRuntimeOperation();
+  if (written) {
+    // Only a confirmed Firebase write is considered reported. If the local
+    // state ever changes during this operation, leave the new value pending.
+    lastPresenceReported = occupancyToPublish;
+    occupancyPublishPending = (presenceDetected != occupancyToPublish);
+  } else {
+    occupancyPublishPending = true;
+  }
+  return written;
 }
 
 void pushOccupancyIfChanged() {
@@ -68,6 +91,14 @@ static void updateMlxPresenceFilter(const bool mlxHumanLikeNow) {
 }
 
 static void refreshMlxPresenceIfDue(const unsigned long now) {
+  if (!mlxAvailable) {
+    if ((now - lastMlxInitAttemptMillis) < MLX_REINIT_INTERVAL_MS) return;
+    lastMlxInitAttemptMillis = now;
+    mlxAvailable = mlx.begin();
+    Serial.println(mlxAvailable ? "MLX90614: recovered." : "MLX90614: retry failed.");
+    if (!mlxAvailable) return;
+  }
+
   if ((now - lastMlxReadMillis) >= MLX_INTERVAL_MS || lastMlxReadMillis == 0) {
     lastMlxReadMillis = now;
     mlxObjectTemp = mlx.readObjectTempC();
@@ -90,24 +121,32 @@ static void refreshMlxPresenceIfDue(const unsigned long now) {
 
 static void refreshOccupancyState() {
   const unsigned long now = millis();
+  bool pirMotionEvent = false;
 
   if (pirMotionLatched) {
     pirMotionLatched = false;
     lastPirMotionMillis = now;
+    pirMotionEvent = true;
   }
 
   const bool pirRawActive = PIR_ACTIVE_HIGH ? (digitalRead(PIR_PIN) == HIGH) : (digitalRead(PIR_PIN) == LOW);
   pirMotionDetected = pirRawActive;
   refreshMlxPresenceIfDue(now);
 
-  const bool pirRecentMotion = (lastPirMotionMillis != 0) && ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
-  const bool anyDetected = pirRawActive || pirRecentMotion || mlxPresenceDetected;
+  const bool anyDetectedNow = pirMotionEvent || pirRawActive || mlxPresenceDetected;
 
-  if (anyDetected) {
+  if (anyDetectedNow) {
     lastPresenceDetectedMillis = now;
+    // Direct evidence only, and throttled inside, so a reboot can restore the
+    // remaining hold without the hold ever refreshing itself.
+    noteOccupancyEvidenceForPersistence();
   }
 
-  presenceDetected = (lastPresenceDetectedMillis != 0) && ((now - lastPresenceDetectedMillis) <= PIR_HOLD_MS);
+  // Hold the combined result once from the latest real sensor detection. The
+  // schedule uses the same duration from lastPresenceDetectedMillis, so this
+  // does not stack another delay before the empty-room shutdown.
+  presenceDetected = (lastPresenceDetectedMillis != 0) &&
+                     ((now - lastPresenceDetectedMillis) <= OCCUPANCY_HOLD_MS);
 }
 
 void refreshOccupancyOnly() {
@@ -137,8 +176,10 @@ void refreshSensorsAndOccupancy() {
 
       if (shouldPublish && canWriteSensorDataToFirebase()) {
         String basePath = "/devices/" + String(DEVICE_ID);
+        markRuntimeOperation("firebase_sensor_write");
         Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
         Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+        clearRuntimeOperation();
       }
     }
   }
@@ -168,6 +209,36 @@ void disableSensorsAndOccupancyIfIdle() {
   }
 }
 
+void tickOccupancySerialDiagnostics() {
+  static unsigned long lastDiagnosticMillis = 0;
+  const unsigned long now = millis();
+  if (lastDiagnosticMillis != 0 &&
+      (now - lastDiagnosticMillis) < OCCUPANCY_SERIAL_DIAGNOSTIC_INTERVAL_MS) {
+    return;
+  }
+  lastDiagnosticMillis = now;
+
+  const bool pirRecentMotion = (lastPirMotionMillis != 0) &&
+                               ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
+  const bool occupancyHoldActive = presenceDetected &&
+                                   !pirMotionDetected &&
+                                   !mlxPresenceDetected;
+  const bool mlxReadingValid = !isnan(mlxObjectTemp) && !isnan(mlxAmbientTemp) &&
+                               !isnan(mlxDeltaTemp);
+  const bool presenceAgeKnown = lastPresenceDetectedMillis != 0;
+  const unsigned long presenceAgeMs = presenceAgeKnown
+                                          ? now - lastPresenceDetectedMillis
+                                          : 0;
+
+  Serial.printf(
+      "Occupancy diag: presence=%d hold=%d pir=%d recent=%d mlx=%d mlxOk=%d "
+      "obj=%.1f amb=%.1f delta=%.1f ageMs=%lu ageKnown=%d pending=%d window=%d\n",
+      presenceDetected, occupancyHoldActive, pirMotionDetected, pirRecentMotion,
+      mlxPresenceDetected, mlxReadingValid, mlxObjectTemp, mlxAmbientTemp,
+      mlxDeltaTemp, presenceAgeMs, presenceAgeKnown, occupancyPublishPending,
+      sensorWindowActive);
+}
+
 bool forceReadDhtNow() {
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
@@ -186,8 +257,10 @@ bool forceReadDhtNow() {
 
   if (shouldPublish && canWriteSensorDataToFirebase()) {
     String basePath = "/devices/" + String(DEVICE_ID);
+    markRuntimeOperation("firebase_sensor_write");
     Firebase.RTDB.setFloat(&fbdo, basePath + "/temperature", lastTemperature);
     Firebase.RTDB.setFloat(&fbdo, basePath + "/humidity", lastHumidity);
+    clearRuntimeOperation();
   }
   
   return true;
@@ -219,15 +292,20 @@ bool callRenderMLAndGetTarget(int& targetTempOut) {
   serializeJson(doc, body);
   Serial.println("ML: sending request -> " + body);
 
+  http.setConnectTimeout(FIREBASE_SOCKET_TIMEOUT_MS);
+  http.setTimeout(FIREBASE_SERVER_RESPONSE_TIMEOUT_MS);
+  markRuntimeOperation("ml_http_request");
   int code = http.POST(body);
   if (code <= 0) {
     Serial.printf("ML: HTTP POST failed (%d)\n", code);
     http.end();
+    clearRuntimeOperation();
     return false;
   }
 
   String response = http.getString();
   http.end();
+  clearRuntimeOperation();
   Serial.printf("ML: HTTP %d response: %s\n", code, response.c_str());
 
   DynamicJsonDocument res(1024);
