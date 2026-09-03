@@ -456,7 +456,7 @@ struct StreamPendingAction {
 - WiFiManager `autoConnect()` and the captive portal are intentionally blocking during boot/provisioning. The portal times out after 5 minutes and the ESP restarts; saved credentials are not erased.
 - Status is written with `setJSON`, so optional reset/token/diagnostic fields may disappear on a later heartbeat. Persistent diagnostic-ring entries and previous-reset breadcrumbs are uploaded once and then cleared locally after a successful heartbeat.
 - `bootCount` is RTC-retained across soft/watchdog resets but is lost on complete power loss. `resetReason=1` means a power-on reset and cannot identify the interrupted operation because RTC breadcrumbs may also be lost.
-- Heartbeat freshness proves Firebase communication, not that every local control path was recently executed. Conversely, web “offline” means heartbeat staleness and does not by itself prove that AC schedule control stopped.
+- Heartbeat freshness proves Firebase communication, not that every local control path was recently executed. Conversely, web "offline" means heartbeat staleness and does not by itself prove that AC schedule control stopped.
 - The current partition is Huge APP with no OTA. Changing the partition scheme can erase or relocate flash data and must be tested separately; do not enable OTA casually on deployed devices.
 
 ---

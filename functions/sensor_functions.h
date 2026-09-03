@@ -10,6 +10,7 @@ bool pushOccupancyToFirebase(bool force);
 void refreshOccupancyOnly();
 void refreshSensorsAndOccupancy();
 void disableSensorsAndOccupancyIfIdle();
+void tickOccupancySerialDiagnostics();
 bool forceReadDhtNow();
 bool callRenderMLAndGetTarget(int& targetTempOut);
 
@@ -203,6 +204,36 @@ void disableSensorsAndOccupancyIfIdle() {
   if (pushOccupancyToFirebase(true)) {
     idleOccupancyPublished = true;
   }
+}
+
+void tickOccupancySerialDiagnostics() {
+  static unsigned long lastDiagnosticMillis = 0;
+  const unsigned long now = millis();
+  if (lastDiagnosticMillis != 0 &&
+      (now - lastDiagnosticMillis) < OCCUPANCY_SERIAL_DIAGNOSTIC_INTERVAL_MS) {
+    return;
+  }
+  lastDiagnosticMillis = now;
+
+  const bool pirRecentMotion = (lastPirMotionMillis != 0) &&
+                               ((now - lastPirMotionMillis) <= PIR_HOLD_MS);
+  const bool occupancyHoldActive = presenceDetected &&
+                                   !pirMotionDetected &&
+                                   !mlxPresenceDetected;
+  const bool mlxReadingValid = !isnan(mlxObjectTemp) && !isnan(mlxAmbientTemp) &&
+                               !isnan(mlxDeltaTemp);
+  const bool presenceAgeKnown = lastPresenceDetectedMillis != 0;
+  const unsigned long presenceAgeMs = presenceAgeKnown
+                                          ? now - lastPresenceDetectedMillis
+                                          : 0;
+
+  Serial.printf(
+      "Occupancy diag: presence=%d hold=%d pir=%d recent=%d mlx=%d mlxOk=%d "
+      "obj=%.1f amb=%.1f delta=%.1f ageMs=%lu ageKnown=%d pending=%d window=%d\n",
+      presenceDetected, occupancyHoldActive, pirMotionDetected, pirRecentMotion,
+      mlxPresenceDetected, mlxReadingValid, mlxObjectTemp, mlxAmbientTemp,
+      mlxDeltaTemp, presenceAgeMs, presenceAgeKnown, occupancyPublishPending,
+      sensorWindowActive);
 }
 
 bool forceReadDhtNow() {

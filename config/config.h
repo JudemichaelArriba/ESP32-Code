@@ -75,9 +75,10 @@ const uint16_t IR_SEND_REPEAT_DELAY_MS = 200;
 const unsigned long HEARTBEAT_INTERVAL_MS = 60UL * 1000UL;
 const unsigned long HEARTBEAT_FAILURE_RETRY_MS = 10UL * 1000UL;
 const unsigned long OCCUPANCY_PUBLISH_RETRY_MS = 5UL * 1000UL;
+const unsigned long OCCUPANCY_SERIAL_DIAGNOSTIC_INTERVAL_MS = 60UL * 1000UL;
 const unsigned long MLX_REINIT_INTERVAL_MS = 30UL * 1000UL;
 // Firebase's synchronous TLS handshake can legitimately take about 60 seconds.
 // Keep the watchdog above that ceiling while still recovering a truly stuck loop.
 const uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 120UL * 1000UL;
-const char* FIRMWARE_VERSION = "2026.08.29-recovery3-occupancy2";
+const char* FIRMWARE_VERSION = "2026.08.29-recovery3-occupancy2-diag1";
 #endif

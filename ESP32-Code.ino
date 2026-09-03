@@ -556,5 +556,7 @@ void loop() {
     disableSensorsAndOccupancyIfIdle();
   }
 
+  tickOccupancySerialDiagnostics();
+
   esp_task_wdt_reset();
 }
