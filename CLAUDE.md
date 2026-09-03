@@ -138,7 +138,7 @@ All global objects and state variables are declared in `structures.h` with `exte
 - Runtime session tracking (start/stop based on AC power transitions)
 - Daily energy cache (runtimeSeconds, estimatedKwh, sessionCount)
 - Periodic flush to Firebase (60s)
-- Writes an NVS checkpoint of the daily totals whenever a flush cannot reach Firebase, so a reboot during an outage does not discard accumulated runtime
+- Writes an NVS checkpoint of the daily totals whenever a flush write is not confirmed, so a reboot during an outage does not discard accumulated runtime. The checkpoint is retired only after both the `/energyDaily` totals write and the `/energyState` marker write are confirmed
 - Merges that checkpoint back once, at startup with verified time, by taking the larger absolute total; it also adopts the checkpoint's `lastFlushAt` so the already-accounted span is not replayed
 
 **heartbeat_functions.h**
@@ -159,6 +159,7 @@ All global objects and state variables are declared in `structures.h` with `exte
 - AC state change logs
 - Bounded RAM ring buffer holding events that could not reach Firebase; entries keep their original event-time `updatedAt` and are replayed after recovery with `bufferedDuringOutage: true`
 - Replay is drained a few entries per loop pass, and an overflow beyond the ring capacity is reported once as a `decision_log_overflow` event
+- A failed replay write starts a `DECISION_LOG_DRAIN_RETRY_MS` cooldown, so a broken session is never reattempted with a blocking write on the very next loop pass; a successful write clears the cooldown immediately
 
 **utility_functions.h**
 - `onPirMotion()`: PIR interrupt handler
@@ -281,6 +282,7 @@ Schedule logic follows this priority:
 - `OCCUPANCY_PERSIST_MAX_AGE_MS`: 12 hours; a checkpoint older than this is never trusted for warm recovery
 - `DECISION_LOG_BUFFER_CAPACITY`: 24 buffered decision log entries (RAM only)
 - `DECISION_LOG_DRAIN_PER_CYCLE`: 2 replayed entries per loop pass
+- `DECISION_LOG_DRAIN_RETRY_MS`: 10s cooldown after a failed replay write; only failures start it, so a healthy backlog still drains at the full per-cycle rate
 - `ENERGY_FLUSH_INTERVAL_SEC`: 60s
 - `FIREBASE_READY_LOSS_TIMEOUT_MS`: 75s
 - `NETWORK_OUTAGE_RESTART_MS`: 10 minutes
@@ -474,6 +476,9 @@ struct StreamPendingAction {
 
 - Hardcode WiFi SSID/password in firmware (use WiFiManager)
 - Print, paste, commit, or document values from `config/secrets.h`
+- Read `config/secrets.h` at all - not to print it, not to parse it, not to load it into memory for any purpose. Treat the file as off limits unless the user explicitly asks for something that requires it
+- Authenticate to Firebase, the ML endpoint, or any other remote service using project credentials unless the user explicitly asks for that in the request at hand. Never sign in to inspect, verify, or debug on your own initiative
+- Query the deployed database to verify behavior. Verification happens on the device, only when the user says to run it, using Serial output and observed device behavior as the evidence - never by reading or writing the backend with credentials taken from the project
 - Call `wm.resetSettings()` automatically on WiFi failure (only through reset button)
 - Trust client-side AC state (always use `acIrStateTrusted` flag)
 - Block the main loop with WiFi or Firebase calls
@@ -482,6 +487,8 @@ struct StreamPendingAction {
 - Mark occupancy as reported before Firebase confirms the write
 - Restore occupancy, the grace baseline, or energy totals while `timeIsValid()` is false; an unverified clock must never resurrect state
 - Replay a whole buffered decision log backlog in one loop pass; the Firebase client is synchronous and the watchdog is 120s
+- Retry any blocking Firebase write on every loop pass without an interval guard; `Firebase.ready()` reports token state, not the health of the socket a write just died on
+- Decide durability from a reachability probe. Clearing a checkpoint, retiring local state, or marking something synced may only follow a **confirmed write result**; `Firebase.ready()` and `WiFi.status()` both read true while a stale token fails every write
 - Store energy checkpoints as increments; totals are absolute so a repeated merge stays idempotent
 - Refresh `lastPresenceDetectedMillis` from `presenceDetected` or another held/derived value
 - Add a second empty-room grace after the unified occupancy hold without explicitly changing the product behavior

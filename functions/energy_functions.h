@@ -155,9 +155,10 @@ static void closeEnergySession(const String& source) {
   energyRuntimeState.sessionStartedAt = "";
   energyRuntimeState.lastSource = source;
 
-  syncEnergyStateToFirebase();
-
-  if (!canSyncEnergyToFirebase()) {
+  // Checkpoint unless the close is confirmed remotely. Testing reachability
+  // instead would skip the checkpoint whenever the write failed while Firebase
+  // merely looked available, leaving the session close unprotected.
+  if (!syncEnergyStateToFirebase()) {
     persistEnergyCheckpoint();
   }
 }
@@ -239,6 +240,11 @@ static void flushEnergyRuntime(bool force) {
     return;
   }
 
+  // Only a confirmed write may retire the checkpoint. Firebase.ready() reports
+  // token lifecycle state, not whether a write will land: after a session
+  // rebuild it reads true while the token is still stale and every write fails.
+  bool writesConfirmed = true;
+
   time_t cursorEpoch = lastFlushEpoch;
   while (cursorEpoch < nowEpoch) {
     struct tm cursorTm;
@@ -272,7 +278,7 @@ static void flushEnergyRuntime(bool force) {
 
     energyDailyCache.runtimeSeconds += segmentSeconds;
     energyDailyCache.estimatedKwh = computeEstimatedKwh(energyDailyCache.runtimeSeconds);
-    syncEnergyDailyCache();
+    if (!syncEnergyDailyCache()) writesConfirmed = false;
 
     cursorEpoch = segmentEndEpoch;
   }
@@ -282,11 +288,14 @@ static void flushEnergyRuntime(bool force) {
   if (assignedRoom.found) {
     energyRuntimeState.roomUid = assignedRoom.uid;
   }
-  syncEnergyStateToFirebase();
+  if (!syncEnergyStateToFirebase()) writesConfirmed = false;
 
-  // Runtime accrues locally whether or not Firebase is reachable. Checkpoint it
-  // so a reboot during the outage cannot discard the accumulated total.
-  if (canSyncEnergyToFirebase()) {
+  // Runtime accrues locally whether or not the write lands. The checkpoint may
+  // only be retired once both halves are confirmed: the daily totals in
+  // /energyDaily and the lastFlushAt marker in /energyState. An unreachable
+  // Firebase already returns false from both helpers, so the offline path is
+  // unchanged; this also covers reachable-but-failed writes.
+  if (writesConfirmed) {
     clearEnergyCheckpoint();
   } else {
     persistEnergyCheckpoint();

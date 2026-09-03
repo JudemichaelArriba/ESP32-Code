@@ -281,6 +281,11 @@ bool persistEnergyCheckpoint() {
     energyCheckpointCache = next;
     energyCheckpointCacheValid = true;
     energyCheckpointStored = true;
+    // Confirms the offline accounting actually reached flash. The unchanged-content
+    // path above returns before this, so a stable session does not spam the log.
+    Serial.printf("Energy checkpoint: saved %s runtime=%lus sessions=%lu.\n",
+                  next.dateKey, (unsigned long)next.runtimeSeconds,
+                  (unsigned long)next.sessionCount);
   } else {
     Serial.println("Energy checkpoint: NVS write failed.");
   }
@@ -290,15 +295,20 @@ bool persistEnergyCheckpoint() {
 // Cleared once the accumulated totals are safely back in Firebase. Called on
 // every healthy flush cycle, so it must be free when nothing is stored.
 void clearEnergyCheckpoint() {
+  // No-op branch: nothing stored, so stay silent and touch no flash.
   if (!energyCheckpointStored) return;
 
   Preferences preferences;
-  if (!preferences.begin(DEVICE_STATE_NAMESPACE, false)) return;
+  if (!preferences.begin(DEVICE_STATE_NAMESPACE, false)) {
+    Serial.println("Energy checkpoint: unable to open NVS to clear.");
+    return;
+  }
   preferences.remove("engCkpt");
   preferences.end();
   memset(&energyCheckpointCache, 0, sizeof(energyCheckpointCache));
   energyCheckpointCacheValid = false;
   energyCheckpointStored = false;
+  Serial.println("Energy checkpoint: cleared after confirmed Firebase write.");
 }
 
 // ---------------------------------------------------------------------------

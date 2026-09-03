@@ -83,9 +83,13 @@ const uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 120UL * 1000UL;
 
 // Decision logs that cannot reach Firebase are held in RAM and replayed after
 // recovery. The drain budget keeps the synchronous Firebase client from running
-// a long burst of writes inside a single loop pass.
+// a long burst of writes inside a single loop pass, and the retry interval keeps
+// a failing drain from reattempting a blocking write on every pass while the
+// session is unhealthy. Only failures start the cooldown, so a healthy backlog
+// still drains at the full per-cycle rate.
 const uint8_t DECISION_LOG_BUFFER_CAPACITY = 24;
 const uint8_t DECISION_LOG_DRAIN_PER_CYCLE = 2;
+const unsigned long DECISION_LOG_DRAIN_RETRY_MS = 10UL * 1000UL;
 
 // Reboot recovery for occupancy and the empty-room grace baseline. Direct sensor
 // evidence is checkpointed to NVS no more than once per interval to bound flash

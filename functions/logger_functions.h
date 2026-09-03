@@ -16,6 +16,10 @@ static BufferedDecisionLog decisionLogBuffer[DECISION_LOG_BUFFER_CAPACITY];
 static uint8_t decisionLogBufferHead = 0;
 static uint8_t decisionLogBufferCount = 0;
 static uint16_t droppedDecisionLogCount = 0;
+// Set only when a replay write fails. Firebase.ready() reports token state, not
+// the health of the socket a write just died on, so a failed drain must back off
+// instead of reattempting a blocking write on the next pass.
+static unsigned long lastDecisionLogDrainFailureMillis = 0;
 
 static bool canWriteDecisionLogToFirebase() {
   return firebaseInitialized && WiFi.status() == WL_CONNECTED && Firebase.ready();
@@ -105,19 +109,30 @@ static void emitDecisionLogRecord(const BufferedDecisionLog& record) {
 }
 
 // Drains a bounded number of entries per loop pass. The Firebase client is
-// synchronous, so a full backlog must never be flushed in one pass.
+// synchronous, so a full backlog must never be flushed in one pass, and a drain
+// that just failed must not reattempt a blocking write on the very next pass.
 void drainBufferedDecisionLogs() {
   if (decisionLogBufferCount == 0 && droppedDecisionLogCount == 0) return;
   if (!canWriteDecisionLogToFirebase()) return;
+
+  // Failure cooldown, mirroring HEARTBEAT_FAILURE_RETRY_MS. Successful drains
+  // never set this, so a healthy backlog still clears at the per-cycle rate.
+  const unsigned long now = millis();
+  if (lastDecisionLogDrainFailureMillis != 0 &&
+      (now - lastDecisionLogDrainFailureMillis) < DECISION_LOG_DRAIN_RETRY_MS) {
+    return;
+  }
 
   for (uint8_t sent = 0;
        sent < DECISION_LOG_DRAIN_PER_CYCLE && decisionLogBufferCount > 0;
        sent++) {
     if (!writeDecisionLogRecord(decisionLogBuffer[decisionLogBufferHead], true)) {
-      return;  // Still unavailable; retry on a later pass.
+      lastDecisionLogDrainFailureMillis = now == 0 ? 1 : now;
+      return;  // Still unavailable; retry after the cooldown.
     }
     decisionLogBufferHead = (decisionLogBufferHead + 1) % DECISION_LOG_BUFFER_CAPACITY;
     decisionLogBufferCount--;
+    lastDecisionLogDrainFailureMillis = 0;
   }
 
   if (decisionLogBufferCount > 0 || droppedDecisionLogCount == 0) return;
@@ -132,6 +147,9 @@ void drainBufferedDecisionLogs() {
   overflow.aiAutoApply = aiAutoApplyEnabled;
   if (writeDecisionLogRecord(overflow, true)) {
     droppedDecisionLogCount = 0;
+    lastDecisionLogDrainFailureMillis = 0;
+  } else {
+    lastDecisionLogDrainFailureMillis = now == 0 ? 1 : now;
   }
 }
 
