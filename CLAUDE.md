@@ -6,7 +6,23 @@ OcuTemp is production-grade ESP32 firmware for room air-conditioner automation. 
 
 The device operates as a deployed room controller with WiFi provisioning separate from AC control logic, enabling network changes without reflashing firmware.
 
-Current production baseline: `2026.08.29-recovery3-occupancy2-diag1`. Build for an ESP32 Dev Module with the `Huge APP (3 MB No OTA/1 MB SPIFFS)` partition scheme. The current image does not fit the default application partition, and the deployed layout does not support OTA.
+Current production baseline: `2026.09.03-recovery3-occupancy3-accounting1`. Build for an ESP32 Dev Module with the `Huge APP (3 MB No OTA/1 MB SPIFFS)` partition scheme. The current image does not fit the default application partition, and the deployed layout does not support OTA.
+
+---
+
+## AI Agent Persona
+
+**Act as**: IoT Senior Engineer
+
+When working with this codebase, assume the role of a senior IoT engineer with expertise in:
+- Embedded systems development (ESP32, Arduino framework)
+- Production firmware architecture and best practices
+- Network resilience and recovery patterns
+- State management and persistence in resource-constrained environments
+- Real-time control systems with safety-critical considerations
+- Flash wear management and long-running device stability
+
+Apply this expertise when reviewing code, making recommendations, debugging issues, or implementing features. Prioritize reliability, safety, maintainability, and production readiness in all decisions.
 
 ---
 
@@ -56,6 +72,7 @@ ESP32-Code/
     ├── sensor_functions.h      # DHT22, PIR, MLX90614, occupancy, ML endpoint
     ├── energy_functions.h      # Runtime sessions, energy tracking, daily cache
     ├── heartbeat_functions.h   # Device status heartbeat
+    ├── persistence_functions.h # NVS override/checkpoint state, diagnostic ring
     ├── logger_functions.h      # Decision logs, ML logs, AC state logs
     └── utility_functions.h     # Time helpers, schedule parsing, PIR ISR
 ```
@@ -121,6 +138,8 @@ All global objects and state variables are declared in `structures.h` with `exte
 - Runtime session tracking (start/stop based on AC power transitions)
 - Daily energy cache (runtimeSeconds, estimatedKwh, sessionCount)
 - Periodic flush to Firebase (60s)
+- Writes an NVS checkpoint of the daily totals whenever a flush cannot reach Firebase, so a reboot during an outage does not discard accumulated runtime
+- Merges that checkpoint back once, at startup with verified time, by taking the larger absolute total; it also adopts the checkpoint's `lastFlushAt` so the already-accounted span is not replayed
 
 **heartbeat_functions.h**
 - Periodic status heartbeat (60s interval)
@@ -128,6 +147,8 @@ All global objects and state variables are declared in `structures.h` with `exte
 
 **persistence_functions.h**
 - Persists manual override state in NVS
+- Persists the energy checkpoint (absolute daily totals, so a merge is idempotent)
+- Persists the occupancy/schedule checkpoint (wall-clock window start and last direct sensor evidence)
 - Maintains a six-record diagnostic ring across resets
 - Stores an RTC operation breadcrumb around marked blocking network calls
 - Uploads saved diagnostics in the next successful heartbeat, then clears the local ring
@@ -136,6 +157,8 @@ All global objects and state variables are declared in `structures.h` with `exte
 - Decision event logs (`/decisionLogs`)
 - ML suggestion logs
 - AC state change logs
+- Bounded RAM ring buffer holding events that could not reach Firebase; entries keep their original event-time `updatedAt` and are replayed after recovery with `bufferedDuringOutage: true`
+- Replay is drained a few entries per loop pass, and an overflow beyond the ring capacity is reported once as a `decision_log_overflow` event
 
 **utility_functions.h**
 - `onPirMotion()`: PIR interrupt handler
@@ -155,7 +178,7 @@ All global objects and state variables are declared in `structures.h` with `exte
 5. Connect with saved WiFi credentials; open the protected captive portal when required
 6. Request NTP synchronization
 7. Apply a still-valid persisted manual override before Firebase startup
-8. Initialize the 120-second loop-task watchdog
+8. Initialize the 120-second loop-task watchdog (schedule/occupancy warm recovery happens later, on the first minute-control pass, because it needs the room assignment)
 9. Enter the main loop; Firebase authentication starts only after WiFi and time are usable
 
 ---
@@ -177,6 +200,7 @@ All global objects and state variables are declared in `structures.h` with `exte
 9. Check manual override expiry
 10. Tick energy tracking (periodic flush)
 11. Tick heartbeat
+11a. Drain a bounded number of buffered decision logs when Firebase is writable
 12. Poll sensors only in a manual/pre-cool/schedule window; otherwise reset and publish idle occupancy false once
 13. Reset the loop-task watchdog
 
@@ -212,7 +236,7 @@ Schedule logic follows this priority:
 | `/devices/{DEVICE_ID}/energyState` | Current runtime session |
 | `/devices/{DEVICE_ID}/energyDaily/{date}` | Daily runtime and kWh |
 | `/devices/{DEVICE_ID}/mlSuggestion` | ML temperature suggestion |
-| `/decisionLogs` | Decision events, mode changes, AC state changes |
+| `/decisionLogs` | Decision events, mode changes, AC state changes. An entry recorded while Firebase was unreachable carries `bufferedDuringOutage: true` and an `updatedAt` from when the event happened, not when it was uploaded |
 
 ---
 
@@ -253,6 +277,10 @@ Schedule logic follows this priority:
 - `HEARTBEAT_FAILURE_RETRY_MS`: 10s
 - `OCCUPANCY_PUBLISH_RETRY_MS`: 5s while a change is pending
 - `OCCUPANCY_SERIAL_DIAGNOSTIC_INTERVAL_MS`: 60s local Serial diagnostic only; it creates no Firebase write or sensor read
+- `OCCUPANCY_PERSIST_MIN_INTERVAL_MS`: 60s minimum between NVS writes of direct occupancy evidence (flash wear bound)
+- `OCCUPANCY_PERSIST_MAX_AGE_MS`: 12 hours; a checkpoint older than this is never trusted for warm recovery
+- `DECISION_LOG_BUFFER_CAPACITY`: 24 buffered decision log entries (RAM only)
+- `DECISION_LOG_DRAIN_PER_CYCLE`: 2 replayed entries per loop pass
 - `ENERGY_FLUSH_INTERVAL_SEC`: 60s
 - `FIREBASE_READY_LOSS_TIMEOUT_MS`: 75s
 - `NETWORK_OUTAGE_RESTART_MS`: 10 minutes
@@ -279,6 +307,17 @@ Schedule logic follows this priority:
 `lastPresenceReported` means the last value Firebase actually confirmed, not the last attempted value. If Firebase is unavailable when local occupancy changes, `occupancyPublishPending` remains true and the latest local value is retried no faster than every 5 seconds after Firebase becomes usable. Never set `lastPresenceReported` before a successful RTDB write.
 
 MLX classification requires object temperature from 30-40°C, object-minus-ambient delta of at least 2°C, and two consecutive positive reads. Two consecutive negative/invalid classifications clear `mlxPresenceDetected`; the unified hold prevents UI flicker after it clears.
+
+## Reboot Warm Recovery
+
+The goal is reboot transparency: a device that restarts mid-window should reach the same control decision as one that never restarted. Occupancy and the empty-room grace baseline are therefore anchored to wall clock in NVS, not to `millis()`.
+
+- On a genuine schedule-window entry the device persists the window key and the wall-clock moment it entered.
+- Direct PIR/MLX evidence updates a persisted `lastPresenceEpoch`, at most once per `OCCUPANCY_PERSIST_MIN_INTERVAL_MS`.
+- On the first minute-control pass after boot, if the persisted window key equals the currently active one, the device reconstructs `scheduleWindowEnteredMillis` from the stored epoch instead of restarting the grace from boot time. If the stored evidence is still inside the 5-minute hold it also restores `presenceDetected` and `lastPresenceDetectedMillis`.
+- Restoration is refused when the clock is not verified, when the stored epoch is in the future, when the window key differs, or when the checkpoint is older than `OCCUPANCY_PERSIST_MAX_AGE_MS`. A refusal falls back to the ordinary fresh-entry behaviour.
+- A warm recovery can only bring the empty-room shutdown forward or extend an existing hold by at most the remaining 5 minutes. It never powers the AC on by itself, and a reboot no longer grants the room an extra grace period.
+- Because a warm recovery can find the grace already spent, the boot-time IR refresh is suppressed when the empty shutdown is due, so the AC is not switched on immediately before being switched off. If a person is then sensed, the next minute pass powers the AC back on normally.
 
 ## Heartbeat and Occupancy Diagnostics
 
@@ -401,6 +440,8 @@ struct StreamPendingAction {
 - Publish occupancy changes to Firebase
 - Keep `OCCUPANCY_HOLD_MS`, `PIR_HOLD_MS`, and `SCHEDULE_NO_OCC_OFF_MS` aligned unless a deliberate product decision requires different UI and AC timings
 - Update `lastPresenceDetectedMillis` only from direct PIR/MLX evidence, never from an already-held occupancy value; otherwise the hold doubles itself
+- Persist occupancy evidence only from that same direct evidence, and keep the NVS write throttled
+- Compare occupancy and grace references as elapsed ages, never as raw `millis()` magnitudes; a restored reference is deliberately offset and magnitude comparisons break across it
 
 **Time Handling**
 - Validate time with `timeIsValid()` before using `struct tm`
@@ -439,6 +480,9 @@ struct StreamPendingAction {
 - Poll sensors continuously when outside sensor windows
 - Ignore Firebase control stream errors
 - Mark occupancy as reported before Firebase confirms the write
+- Restore occupancy, the grace baseline, or energy totals while `timeIsValid()` is false; an unverified clock must never resurrect state
+- Replay a whole buffered decision log backlog in one loop pass; the Firebase client is synchronous and the watchdog is 120s
+- Store energy checkpoints as increments; totals are absolute so a repeated merge stays idempotent
 - Refresh `lastPresenceDetectedMillis` from `presenceDetected` or another held/derived value
 - Add a second empty-room grace after the unified occupancy hold without explicitly changing the product behavior
 - Skip IR burst repeats (AC units need multiple IR signals)
@@ -458,6 +502,10 @@ struct StreamPendingAction {
 - `bootCount` is RTC-retained across soft/watchdog resets but is lost on complete power loss. `resetReason=1` means a power-on reset and cannot identify the interrupted operation because RTC breadcrumbs may also be lost.
 - Heartbeat freshness proves Firebase communication, not that every local control path was recently executed. Conversely, web "offline" means heartbeat staleness and does not by itself prove that AC schedule control stopped.
 - The current partition is Huge APP with no OTA. Changing the partition scheme can erase or relocate flash data and must be tested separately; do not enable OTA casually on deployed devices.
+- The buffered decision log ring is RAM only. It survives an outage but not a power cycle inside that outage; the reboot-durable evidence of an outage is the `network_outage_start` / `network_outage_recovered` pair in the persistent diagnostic ring.
+- When the ring overflows, the oldest entries are dropped and the total is reported once as a `decision_log_overflow` event after the backlog drains.
+- An energy checkpoint whose `dateKey` is not today is discarded rather than merged, because writing it into the wrong daily bucket would be worse than the small under-count. A reboot that crosses midnight during an outage can therefore lose the previous day's unsynced tail.
+- Warm recovery depends on the schedule window key, which embeds the calendar date, so it cannot resurrect state across days even before the 12-hour age cap applies.
 
 ---
 

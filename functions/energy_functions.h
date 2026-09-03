@@ -156,6 +156,63 @@ static void closeEnergySession(const String& source) {
   energyRuntimeState.lastSource = source;
 
   syncEnergyStateToFirebase();
+
+  if (!canSyncEnergyToFirebase()) {
+    persistEnergyCheckpoint();
+  }
+}
+
+// Merges a checkpoint written before a reboot back into today's totals. Totals
+// are absolute, so taking the larger value is idempotent and cannot double
+// count a span that already reached Firebase.
+static void restoreEnergyCheckpointIfNeeded(const String& todayKey) {
+  static bool energyCheckpointRestoreAttempted = false;
+  if (energyCheckpointRestoreAttempted) return;
+  energyCheckpointRestoreAttempted = true;
+
+  EnergyCheckpoint checkpoint;
+  if (!loadEnergyCheckpoint(checkpoint)) return;
+
+  if (todayKey != String(checkpoint.dateKey)) {
+    // A checkpoint from an earlier day is not merged: writing it into the wrong
+    // daily bucket would be worse than the small under-count it represents.
+    Serial.println("Energy checkpoint: stale date, discarded.");
+    recordPersistentDiagnostic("energy_ckpt_stale", String(checkpoint.dateKey));
+    clearEnergyCheckpoint();
+    return;
+  }
+
+  if (checkpoint.runtimeSeconds > energyDailyCache.runtimeSeconds) {
+    energyDailyCache.runtimeSeconds = checkpoint.runtimeSeconds;
+  }
+  if (checkpoint.sessionCount > energyDailyCache.sessionCount) {
+    energyDailyCache.sessionCount = checkpoint.sessionCount;
+  }
+  energyDailyCache.estimatedKwh = computeEstimatedKwh(energyDailyCache.runtimeSeconds);
+
+  // The remote lastFlushAt is stale by exactly the span the checkpoint already
+  // accounted for. Adopting the newer marker prevents replaying that span.
+  time_t checkpointFlushEpoch;
+  if (parseLocalIsoStringToEpoch(String(checkpoint.lastFlushAt), checkpointFlushEpoch)) {
+    time_t loadedFlushEpoch;
+    if (!parseLocalIsoStringToEpoch(energyRuntimeState.lastFlushAt, loadedFlushEpoch) ||
+        checkpointFlushEpoch > loadedFlushEpoch) {
+      energyRuntimeState.lastFlushAt = String(checkpoint.lastFlushAt);
+    }
+  }
+  if (energyRuntimeState.sessionStartedAt.length() == 0 &&
+      checkpoint.sessionStartedAt[0] != '\0') {
+    energyRuntimeState.sessionStartedAt = String(checkpoint.sessionStartedAt);
+  }
+
+  Serial.printf("Energy checkpoint: recovered %lu runtime seconds for %s.\n",
+                energyDailyCache.runtimeSeconds, checkpoint.dateKey);
+  recordPersistentDiagnostic("energy_ckpt_restored",
+                             String(checkpoint.runtimeSeconds) + "s");
+
+  if (syncEnergyDailyCache()) {
+    clearEnergyCheckpoint();
+  }
 }
 
 static void flushEnergyRuntime(bool force) {
@@ -226,6 +283,14 @@ static void flushEnergyRuntime(bool force) {
     energyRuntimeState.roomUid = assignedRoom.uid;
   }
   syncEnergyStateToFirebase();
+
+  // Runtime accrues locally whether or not Firebase is reachable. Checkpoint it
+  // so a reboot during the outage cannot discard the accumulated total.
+  if (canSyncEnergyToFirebase()) {
+    clearEnergyCheckpoint();
+  } else {
+    persistEnergyCheckpoint();
+  }
 }
 
 void loadEnergyProfileFromFirebase() {
@@ -316,7 +381,10 @@ void initializeEnergyTrackingForCurrentState() {
   struct tm nowTm;
   bool hasValidTime = timeIsValid(nowTm);
   if (hasValidTime) {
-    loadEnergyDailyCache(dateKeyFromTm(nowTm));
+    const String todayKey = dateKeyFromTm(nowTm);
+    loadEnergyDailyCache(todayKey);
+    // Only with verified time: an unvalidated clock must not merge stored totals.
+    restoreEnergyCheckpointIfNeeded(todayKey);
   }
 
   if (acPowerState) {

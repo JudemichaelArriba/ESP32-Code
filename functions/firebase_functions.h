@@ -86,6 +86,9 @@ static void noteNetworkOutageStarted() {
   if (networkOutageSinceMillis == 0) {
     const unsigned long now = millis();
     networkOutageSinceMillis = now == 0 ? 1 : now;
+    // Reboot-durable marker: proves the outage window even if a power cycle
+    // discards the RAM-buffered decision logs recorded inside it.
+    recordPersistentDiagnostic("network_outage_start", "firebase or ntp unavailable");
   }
 }
 

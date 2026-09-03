@@ -94,6 +94,9 @@ void tickHeartbeat() {
 
   String path = "/devices/" + String(DEVICE_ID) + "/status";
 
+  // Captured before the success handler clears the outage timer.
+  const bool outageWasActive = networkOutageSinceMillis != 0;
+
   markRuntimeOperation("firebase_heartbeat");
   bool written = Firebase.RTDB.setJSON(&fbdo, path, &json);
   clearRuntimeOperation();
@@ -105,6 +108,11 @@ void tickHeartbeat() {
     noteFirebaseDataSuccess();
     clearUploadedPersistentDiagnostics();
     previousResetBreadcrumbAvailable = false;
+    // Recorded after the ring is cleared so it survives to the next heartbeat
+    // and closes the outage window that "network_outage_start" opened.
+    if (outageWasActive) {
+      recordPersistentDiagnostic("network_outage_recovered", "heartbeat restored");
+    }
   } else {
     String err = fbdo.errorReason();
     const int httpCode = fbdo.httpCode();

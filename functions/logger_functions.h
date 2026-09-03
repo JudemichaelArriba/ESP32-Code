@@ -8,6 +8,15 @@
 
 static const unsigned long DECISION_LOG_FAILURE_COOLDOWN_MS = 5UL * 60UL * 1000UL;
 
+void drainBufferedDecisionLogs();
+
+// Events that could not reach Firebase. Kept in RAM only: a reboot mid-outage
+// is covered by the persistent diagnostic ring, not by this buffer.
+static BufferedDecisionLog decisionLogBuffer[DECISION_LOG_BUFFER_CAPACITY];
+static uint8_t decisionLogBufferHead = 0;
+static uint8_t decisionLogBufferCount = 0;
+static uint16_t droppedDecisionLogCount = 0;
+
 static bool canWriteDecisionLogToFirebase() {
   return firebaseInitialized && WiFi.status() == WL_CONNECTED && Firebase.ready();
 }
@@ -16,17 +25,51 @@ static String loggerRoomUid() {
   return assignedRoom.found ? assignedRoom.uid : String("");
 }
 
-static void addCommonDecisionFields(FirebaseJson& json, const String& eventType) {
-  json.set("deviceId", String(DEVICE_ID));
-  json.set("roomUid", loggerRoomUid());
-  json.set("eventType", eventType);
-  json.set("mode", lastScheduleMode);
-  json.set("updatedAt", nowIsoString());
-  json.set("uptimeMs", (double)millis());
+static void fillCommonDecisionRecord(BufferedDecisionLog& record, const String& eventType) {
+  memset(&record, 0, sizeof(record));
+  copyToFixedBuffer(eventType, record.eventType, sizeof(record.eventType));
+  copyToFixedBuffer(loggerRoomUid(), record.roomUid, sizeof(record.roomUid));
+  copyToFixedBuffer(lastScheduleMode, record.mode, sizeof(record.mode));
+  // Captured at event time so a replayed entry keeps its real wall clock.
+  copyToFixedBuffer(nowIsoString(), record.updatedAt, sizeof(record.updatedAt));
+  record.uptimeMs = (uint32_t)millis();
+  record.suggestedTemp = -1;
+  record.previousTemp = -1;
 }
 
-static bool pushDecisionLog(FirebaseJson& json) {
+static void buildDecisionLogJson(const BufferedDecisionLog& record, bool buffered,
+                                 FirebaseJson& json) {
+  json.set("deviceId", String(DEVICE_ID));
+  json.set("roomUid", String(record.roomUid));
+  json.set("eventType", String(record.eventType));
+  json.set("mode", String(record.mode));
+  json.set("updatedAt", String(record.updatedAt));
+  json.set("uptimeMs", (double)record.uptimeMs);
+  json.set("source", String(record.source));
+  json.set("power", record.power);
+  json.set("targetTemp", (int)record.targetTemp);
+  if (record.acStateChange) {
+    json.set("previousPower", record.previousPower);
+    json.set("previousTemp", (int)record.previousTemp);
+    json.set("previousSource", String(record.previousSource));
+    json.set("irSent", record.irSent);
+  } else if (record.suggestedTemp >= AC_TEMP_MIN && record.suggestedTemp <= AC_TEMP_MAX) {
+    json.set("suggestedTemp", (int)record.suggestedTemp);
+  }
+  json.set("aiAutoApply", record.aiAutoApply);
+  json.set("applied", record.applied);
+  json.set("reason", String(record.reason));
+  if (buffered) {
+    // Recorded locally during an outage and uploaded after recovery.
+    json.set("bufferedDuringOutage", true);
+  }
+}
+
+static bool writeDecisionLogRecord(const BufferedDecisionLog& record, bool buffered) {
   if (!canWriteDecisionLogToFirebase()) return false;
+
+  FirebaseJson json;
+  buildDecisionLogJson(record, buffered, json);
 
   markRuntimeOperation("firebase_decision_log");
   bool written = Firebase.RTDB.pushJSON(&fbdo, "/decisionLogs", &json);
@@ -39,6 +82,59 @@ static bool pushDecisionLog(FirebaseJson& json) {
   return false;
 }
 
+static void enqueueDecisionLogRecord(const BufferedDecisionLog& record) {
+  if (decisionLogBufferCount == DECISION_LOG_BUFFER_CAPACITY) {
+    // Drop the oldest entry. The newest device state is the most useful after a
+    // long outage, and the dropped total is reported once the backlog drains.
+    decisionLogBufferHead = (decisionLogBufferHead + 1) % DECISION_LOG_BUFFER_CAPACITY;
+    decisionLogBufferCount--;
+    if (droppedDecisionLogCount < 65535) droppedDecisionLogCount++;
+  }
+
+  const uint8_t slot =
+      (decisionLogBufferHead + decisionLogBufferCount) % DECISION_LOG_BUFFER_CAPACITY;
+  decisionLogBuffer[slot] = record;
+  decisionLogBufferCount++;
+}
+
+static void emitDecisionLogRecord(const BufferedDecisionLog& record) {
+  // While a backlog exists, queue behind it instead of overtaking it, so
+  // /decisionLogs keeps the order the events actually happened in.
+  if (decisionLogBufferCount == 0 && writeDecisionLogRecord(record, false)) return;
+  enqueueDecisionLogRecord(record);
+}
+
+// Drains a bounded number of entries per loop pass. The Firebase client is
+// synchronous, so a full backlog must never be flushed in one pass.
+void drainBufferedDecisionLogs() {
+  if (decisionLogBufferCount == 0 && droppedDecisionLogCount == 0) return;
+  if (!canWriteDecisionLogToFirebase()) return;
+
+  for (uint8_t sent = 0;
+       sent < DECISION_LOG_DRAIN_PER_CYCLE && decisionLogBufferCount > 0;
+       sent++) {
+    if (!writeDecisionLogRecord(decisionLogBuffer[decisionLogBufferHead], true)) {
+      return;  // Still unavailable; retry on a later pass.
+    }
+    decisionLogBufferHead = (decisionLogBufferHead + 1) % DECISION_LOG_BUFFER_CAPACITY;
+    decisionLogBufferCount--;
+  }
+
+  if (decisionLogBufferCount > 0 || droppedDecisionLogCount == 0) return;
+
+  BufferedDecisionLog overflow;
+  fillCommonDecisionRecord(overflow, "decision_log_overflow");
+  copyToFixedBuffer("buffer", overflow.source, sizeof(overflow.source));
+  copyToFixedBuffer("dropped=" + String(droppedDecisionLogCount), overflow.reason,
+                    sizeof(overflow.reason));
+  overflow.power = acPowerState;
+  overflow.targetTemp = (int16_t)normalizeACTemp((float)acTempState);
+  overflow.aiAutoApply = aiAutoApplyEnabled;
+  if (writeDecisionLogRecord(overflow, true)) {
+    droppedDecisionLogCount = 0;
+  }
+}
+
 void logDecisionEvent(const String& eventType,
                       const String& source,
                       bool power,
@@ -47,18 +143,16 @@ void logDecisionEvent(const String& eventType,
                       bool aiAutoApply,
                       bool applied,
                       const String& reason) {
-  FirebaseJson json;
-  addCommonDecisionFields(json, eventType);
-  json.set("source", source);
-  json.set("power", power);
-  json.set("targetTemp", normalizeACTemp((float)targetTemp));
-  if (suggestedTemp >= AC_TEMP_MIN && suggestedTemp <= AC_TEMP_MAX) {
-    json.set("suggestedTemp", suggestedTemp);
-  }
-  json.set("aiAutoApply", aiAutoApply);
-  json.set("applied", applied);
-  json.set("reason", reason);
-  pushDecisionLog(json);
+  BufferedDecisionLog record;
+  fillCommonDecisionRecord(record, eventType);
+  copyToFixedBuffer(source, record.source, sizeof(record.source));
+  copyToFixedBuffer(reason, record.reason, sizeof(record.reason));
+  record.power = power;
+  record.targetTemp = (int16_t)normalizeACTemp((float)targetTemp);
+  record.suggestedTemp = (int16_t)suggestedTemp;
+  record.aiAutoApply = aiAutoApply;
+  record.applied = applied;
+  emitDecisionLogRecord(record);
 }
 
 void logDecisionEventRateLimited(const String& eventType,
@@ -132,19 +226,20 @@ void logAcStateChange(bool previousPower,
                       const String& source,
                       bool irSent,
                       const String& reason) {
-  FirebaseJson json;
-  addCommonDecisionFields(json, "ac_state_changed");
-  json.set("source", source);
-  json.set("power", newPower);
-  json.set("targetTemp", normalizeACTemp((float)newTemp));
-  json.set("previousPower", previousPower);
-  json.set("previousTemp", normalizeACTemp((float)previousTemp));
-  json.set("previousSource", previousSource);
-  json.set("irSent", irSent);
-  json.set("aiAutoApply", aiAutoApplyEnabled);
-  json.set("applied", true);
-  json.set("reason", reason);
-  pushDecisionLog(json);
+  BufferedDecisionLog record;
+  fillCommonDecisionRecord(record, "ac_state_changed");
+  copyToFixedBuffer(source, record.source, sizeof(record.source));
+  copyToFixedBuffer(reason, record.reason, sizeof(record.reason));
+  copyToFixedBuffer(previousSource, record.previousSource, sizeof(record.previousSource));
+  record.acStateChange = true;
+  record.power = newPower;
+  record.targetTemp = (int16_t)normalizeACTemp((float)newTemp);
+  record.previousPower = previousPower;
+  record.previousTemp = (int16_t)normalizeACTemp((float)previousTemp);
+  record.irSent = irSent;
+  record.aiAutoApply = aiAutoApplyEnabled;
+  record.applied = true;
+  emitDecisionLogRecord(record);
 }
 
 #endif

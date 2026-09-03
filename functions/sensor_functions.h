@@ -137,6 +137,9 @@ static void refreshOccupancyState() {
 
   if (anyDetectedNow) {
     lastPresenceDetectedMillis = now;
+    // Direct evidence only, and throttled inside, so a reboot can restore the
+    // remaining hold without the hold ever refreshing itself.
+    noteOccupancyEvidenceForPersistence();
   }
 
   // Hold the combined result once from the latest real sensor detection. The

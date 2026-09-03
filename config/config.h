@@ -80,5 +80,19 @@ const unsigned long MLX_REINIT_INTERVAL_MS = 30UL * 1000UL;
 // Firebase's synchronous TLS handshake can legitimately take about 60 seconds.
 // Keep the watchdog above that ceiling while still recovering a truly stuck loop.
 const uint32_t LOOP_WATCHDOG_TIMEOUT_MS = 120UL * 1000UL;
-const char* FIRMWARE_VERSION = "2026.08.29-recovery3-occupancy2-diag1";
+
+// Decision logs that cannot reach Firebase are held in RAM and replayed after
+// recovery. The drain budget keeps the synchronous Firebase client from running
+// a long burst of writes inside a single loop pass.
+const uint8_t DECISION_LOG_BUFFER_CAPACITY = 24;
+const uint8_t DECISION_LOG_DRAIN_PER_CYCLE = 2;
+
+// Reboot recovery for occupancy and the empty-room grace baseline. Direct sensor
+// evidence is checkpointed to NVS no more than once per interval to bound flash
+// wear. A checkpoint older than the max age is never trusted, which keeps a
+// stale record from resurrecting occupancy after the device was powered down.
+const unsigned long OCCUPANCY_PERSIST_MIN_INTERVAL_MS = 60UL * 1000UL;
+const unsigned long OCCUPANCY_PERSIST_MAX_AGE_MS = 12UL * 60UL * 60UL * 1000UL;
+
+const char* FIRMWARE_VERSION = "2026.09.03-recovery3-occupancy3-accounting1";
 #endif

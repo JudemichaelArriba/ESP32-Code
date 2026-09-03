@@ -97,6 +97,58 @@ struct DiagnosticHistory {
   DiagnosticRecord records[DIAGNOSTIC_HISTORY_CAPACITY];
 };
 
+// ---------------------------------------------------------------------------
+// One decision log event held locally while Firebase is unreachable. Fixed-size
+// fields keep the ring allocation static; String members would fragment the
+// heap on a device that stays up for weeks.
+// ---------------------------------------------------------------------------
+struct BufferedDecisionLog {
+  char eventType[24];
+  char source[24];
+  char reason[40];
+  char mode[24];
+  char updatedAt[24];
+  char roomUid[32];
+  char previousSource[24];
+  int16_t targetTemp;
+  int16_t suggestedTemp;
+  int16_t previousTemp;
+  uint32_t uptimeMs;
+  bool power;
+  bool previousPower;
+  bool aiAutoApply;
+  bool applied;
+  bool irSent;
+  bool acStateChange;
+};
+
+// ---------------------------------------------------------------------------
+// Energy accounting checkpoint. Absolute daily totals (never increments) so a
+// merge after reboot is idempotent and can never double count.
+// ---------------------------------------------------------------------------
+struct EnergyCheckpoint {
+  uint32_t magic;
+  uint8_t version;
+  char dateKey[12];
+  char sessionStartedAt[24];
+  char lastFlushAt[24];
+  uint32_t runtimeSeconds;
+  uint32_t sessionCount;
+};
+
+// ---------------------------------------------------------------------------
+// Occupancy and schedule-window references anchored to wall clock, so a reboot
+// can restore the real grace baseline instead of restarting it from boot time.
+// ---------------------------------------------------------------------------
+struct OccupancyCheckpoint {
+  uint32_t magic;
+  uint8_t version;
+  char scheduleWindowKey[96];
+  int64_t scheduleWindowStartEpoch;
+  int64_t lastPresenceEpoch;
+  bool presenceHeld;
+};
+
 // Global objects
 extern DHT dht;
 extern FirebaseData fbdo;

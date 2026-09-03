@@ -177,6 +177,18 @@ void runMinuteControl(const struct tm& t) {
   const String scheduleWindowKey = inScheduleWindow ? currentScheduleStatus.windowKey : String("");
   unsigned long nowMs = millis();
 
+  // One-shot warm recovery. A reboot inside the window this device was already
+  // serving must not hand the room a brand new grace period measured from boot.
+  static bool checkpointRecoveryAttempted = false;
+  bool warmScheduleRecovery = false;
+  if (!checkpointRecoveryAttempted) {
+    checkpointRecoveryAttempted = true;
+    if (inScheduleWindow) {
+      warmScheduleRecovery = restoreScheduleOccupancyCheckpoint(
+          scheduleWindowKey, nowMs, scheduleWindowEnteredMillis);
+    }
+  }
+
   if (isFirstMinuteRun) {
     if (activeWindowKey.length() > 0) {
       justEnteredWindow = true;
@@ -184,10 +196,16 @@ void runMinuteControl(const struct tm& t) {
     lastActiveWindowKey = activeWindowKey;
 
     if (inScheduleWindow) {
-      justEnteredSchedule = true;
-      scheduleWindowEnteredMillis = nowMs;
       lastScheduleWindowKey = scheduleWindowKey;
-      Serial.println("Schedule window entered: " + scheduleWindowKey);
+      if (warmScheduleRecovery) {
+        // scheduleWindowEnteredMillis already carries the pre-reboot reference.
+        Serial.println("Schedule window resumed: " + scheduleWindowKey);
+      } else {
+        justEnteredSchedule = true;
+        scheduleWindowEnteredMillis = nowMs;
+        noteScheduleWindowEnteredForPersistence(scheduleWindowKey);
+        Serial.println("Schedule window entered: " + scheduleWindowKey);
+      }
     } else {
       lastScheduleWindowKey = "";
     }
@@ -206,6 +224,7 @@ void runMinuteControl(const struct tm& t) {
       justEnteredSchedule = true;
       scheduleWindowEnteredMillis = nowMs;
       lastScheduleWindowKey = scheduleWindowKey;
+      noteScheduleWindowEnteredForPersistence(scheduleWindowKey);
       Serial.println("Schedule window entered: " + scheduleWindowKey);
     } else if (!inScheduleWindow && lastScheduleWindowKey.length() > 0) {
       lastScheduleWindowKey = "";
@@ -272,20 +291,27 @@ void runMinuteControl(const struct tm& t) {
 
   logScheduleModeChange("SCHEDULE");
 
+  // Ages rather than timestamps: the reference can be a value reconstructed
+  // across a reboot, and elapsed-time comparisons stay correct through a
+  // millis() rollover on a device that runs for weeks.
+  const unsigned long windowEmptyAgeMs = nowMs - scheduleWindowEnteredMillis;
+  const unsigned long presenceAgeMs = (lastPresenceDetectedMillis != 0)
+                                          ? (nowMs - lastPresenceDetectedMillis)
+                                          : windowEmptyAgeMs;
+  const unsigned long emptyAgeMs =
+      (presenceAgeMs < windowEmptyAgeMs) ? presenceAgeMs : windowEmptyAgeMs;
+  const bool scheduleNoOccupancyTooLong = emptyAgeMs >= SCHEDULE_NO_OCC_OFF_MS;
+  const bool emptyShutdownDue = !presenceDetected && scheduleNoOccupancyTooLong;
+
+  // After a warm recovery the grace can already be spent, so the boot-time IR
+  // refresh must not switch the AC on one line before switching it back off.
   const bool forceScheduleIr = justEnteredSchedule || !acIrStateTrusted;
-  if (justEnteredSchedule || forceScheduleIr) {
+  if (!emptyShutdownDue && (justEnteredSchedule || forceScheduleIr)) {
     Serial.println("Schedule fallback ON before occupancy grace");
     applyAcState(true, PRECOOL_TEMP, "schedule", true);
   }
 
-  unsigned long emptyReferenceMillis = scheduleWindowEnteredMillis;
-  if (lastPresenceDetectedMillis > emptyReferenceMillis) {
-    emptyReferenceMillis = lastPresenceDetectedMillis;
-  }
-
-  bool scheduleNoOccupancyTooLong = (nowMs - emptyReferenceMillis) >= SCHEDULE_NO_OCC_OFF_MS;
-
-  if (!presenceDetected && scheduleNoOccupancyTooLong) {
+  if (emptyShutdownDue) {
     Serial.println("Schedule empty grace expired");
     applyAcState(false, acTempState, "empty");
     return;
@@ -544,6 +570,7 @@ void loop() {
 
   tickEnergyTracking();
   tickHeartbeat();  // <-- only addition to loop()
+  drainBufferedDecisionLogs();
 
   const bool sensorWindowOnline = shouldPollSensors();
   if (sensorWindowOnline) {
